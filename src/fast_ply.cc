@@ -152,7 +152,14 @@ bool ParseSupportedHeader(const std::vector<char>& buffer,
       continue;
     }
 
-    if (keyword == "comment" || keyword == "obj_info") {
+    // `obj_info` is NOT free-form: PCL's PLY reader maps obj_info num_cols /
+    // num_rows onto the cloud width and height, and echo_rgb_offset_x|y|z onto
+    // the sensor origin. A file carrying it would load with a different point
+    // count here than under pcl::io::loadPLYFile, so refuse the fast path.
+    if (keyword == "obj_info") {
+      return false;
+    }
+    if (keyword == "comment") {
       // Free-form text, carries no data; ignoring it is safe.
       continue;
     }
