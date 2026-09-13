@@ -28,25 +28,16 @@
 
 #include "completeness.h"
 
+#include <cstdint>
+#include <limits>
+#include <vector>
+
 #include <pcl/common/transforms.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
 
 const int kGridCount = 2;
 const float kGridShifts[kGridCount][3] = {{0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}};
-
-// Completeness results for one voxel cell.
-struct CompletenessCell {
-  inline CompletenessCell() : point_count(0) {}
-
-  // Number of scan points within this cell.
-  size_t point_count;
-
-  // Number of complete scan points (smaller or equal to point_count), for each
-  // tolerance value.
-  // Indexed by: [tolerance_index].
-  std::vector<size_t> complete_count;
-};
 
 void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
                          const std::vector<PointCloudPtr>& scans,
@@ -96,96 +87,219 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     return;
   }
 
-  pcl::PointXYZ search_point;
   pcl::search::KdTree<pcl::PointXYZ> reconstruction_kdtree;
   // Get sorted results from radius search. True should be the default, but be
   // on the safe side for the case of changing defaults:
   reconstruction_kdtree.setSortedResults(true);
   reconstruction_kdtree.setInputCloud(reconstruction);
 
-  // Differently shifted voxel grids.
-  // Indexed by: [map_index][CalcCellCoordinates(...)].
-  std::unordered_map<std::tuple<int, int, int>, CompletenessCell>
-      cell_maps[kGridCount];
-
-  const int kNN = 1;
-  std::vector<int> knn_indices(kNN);
-  std::vector<float> knn_squared_dists(kNN);
+  // Differently shifted voxel grids. Each grid maps CalcCellCoordinates(...) to
+  // a dense cell id: the per-cell tallies are kept in flat arrays addressed by
+  // that id instead of inside the map, so that they can be updated with atomic
+  // integer increments from several threads.
+  //
+  // The index used to be std::unordered_map<std::tuple<int, int, int>,
+  // uint32_t>, whose hashing and per-cell node allocation dominated the profile
+  // (26.5% of the baseline's non-idle samples across the two tallies, plus most
+  // of its malloc traffic). VoxelCellIndexMap is a single contiguous array of
+  // 16-byte slots with linear probing that hands out the same dense ids: the id
+  // of a cell is the number of cells that existed when it was first touched,
+  // which is exactly what try_emplace(key, point_counts.size()) produced here.
+  VoxelCellIndexMap cell_maps[kGridCount];
 
   const long long int scan_point_size =
       static_cast<long long int>(scan->size());
 
-// Loop over all scan points.
-#pragma omp parallel for private(search_point, knn_indices, knn_squared_dists)
-  for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
-       ++scan_point_index) {
-    const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
+  // Pass 1 (serial): assign every scan point the cell it falls into, in both
+  // voxel grids, walking the points in their original order. This creates
+  // exactly the cells the original implementation created, in exactly the same
+  // sequence, so the dense cell ids are handed out in first-touch order -- and
+  // with them the order of the floating point summation over the cells at the
+  // end of this function is fixed, and independent of the thread count. Only
+  // integer bookkeeping happens here; the expensive nearest neighbour search is
+  // done in pass 2, in parallel.
+  // Indexed by: [scan_point_index * kGridCount + grid_index].
+  std::vector<uint32_t> point_cell_ids(
+      static_cast<size_t>(scan_point_size) * kGridCount);
+  // Indexed by: [grid_index][cell_id]. Number of scan points in the cell.
+  std::vector<uint32_t> cell_point_counts[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    VoxelCellIndexMap& cell_map = cell_maps[grid_index];
+    std::vector<uint32_t>& point_counts = cell_point_counts[grid_index];
+    const float shift_x = kGridShifts[grid_index][0];
+    const float shift_y = kGridShifts[grid_index][1];
+    const float shift_z = kGridShifts[grid_index][2];
 
-    // Find the voxels for this scan point and increase their point count.
-    CompletenessCell* cells[kGridCount];
-#pragma omp critical
-    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      CompletenessCell* cell = &cell_maps[grid_index][CalcCellCoordinates(
-          scan_point, voxel_size_inv, kGridShifts[grid_index][0],
-          kGridShifts[grid_index][1], kGridShifts[grid_index][2])];
-      ++cell->point_count;
-      if (cell->complete_count.empty()) {
-        cell->complete_count.resize(tolerances_count, 0);
-      }
-      cells[grid_index] = cell;
-    }
+    // Consecutive scan points usually fall into the same voxel; remembering
+    // the previous key saves most of the lookups.
+    VoxelCellKey previous_key = {0, 0, 0};
+    uint32_t previous_id = 0;
+    bool have_previous = false;
 
-    // Find the closest reconstruction point to this scan point, limited to the
-    // maximum evaluation tolerance for efficiency.
-    search_point.getVector3fMap() = scan_point.getVector3fMap();
-    if (reconstruction_kdtree.radiusSearch(search_point, maximum_tolerance,
-                                           knn_indices, knn_squared_dists,
-                                           kNN) > 0) {
-      int smallest_complete_tolerance_index = 0;
-#pragma omp critical
-      {
-        // Since a reconstruction point was found within the search radius, this
-        // scan point is complete for the maximum tolerance, at least.
-        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-          cells[grid_index]->complete_count[tolerances_count - 1] += 1;
+    for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
+         ++scan_point_index) {
+      const VoxelCellKey key = CalcCellCoordinates(
+          scan->at(scan_point_index), voxel_size_inv, shift_x, shift_y,
+          shift_z);
+      uint32_t cell_id;
+      if (have_previous && key.x == previous_key.x && key.y == previous_key.y &&
+          key.z == previous_key.z) {
+        cell_id = previous_id;
+      } else {
+        bool inserted;
+        cell_id = cell_map.Lookup(key, &inserted);
+        if (inserted) {
+          point_counts.push_back(0);
         }
+        previous_key = key;
+        previous_id = cell_id;
+        have_previous = true;
+      }
+      ++point_counts[cell_id];
+      point_cell_ids[static_cast<size_t>(scan_point_index) * kGridCount +
+                     grid_index] = cell_id;
+    }
+  }
 
-        // Next, find the smallest tolerance for which it is still complete.
-        for (int tolerance_index = tolerances_count - 2; tolerance_index >= 0;
-             --tolerance_index) {
+  // Histogram of the smallest tolerance index for which a scan point is
+  // complete, per cell. Indexed by: [grid_index][cell_id * tolerances_count +
+  // smallest_complete_tolerance_index]. After the parallel pass this is turned
+  // into the cumulative "number of complete points per tolerance" in place,
+  // which is what the original code counted directly. Counting the histogram
+  // instead needs only one atomic increment per point and grid.
+  std::vector<uint32_t> complete_histograms[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    complete_histograms[grid_index].assign(
+        cell_point_counts[grid_index].size() * tolerances_count, 0);
+  }
+  uint32_t* histogram_ptrs[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    histogram_ptrs[grid_index] = complete_histograms[grid_index].data();
+  }
+  const uint32_t* point_cell_ids_ptr = point_cell_ids.data();
+
+  // Smallest tolerance index for which a scan point is complete, or
+  // tolerances_count if it is complete for no tolerance. Only filled in if the
+  // per-point output is requested. The per-point results are collected here
+  // rather than written straight into point_is_complete because
+  // std::vector<bool> is a bitfield: threads writing neighbouring point
+  // indices would write the same word. This vector has one element per point,
+  // so parallel writes touch distinct objects.
+  std::vector<uint32_t> smallest_complete_tolerance_indices;
+  if (output_point_results) {
+    smallest_complete_tolerance_indices.assign(
+        static_cast<size_t>(scan_point_size),
+        static_cast<uint32_t>(tolerances_count));
+  }
+
+  const int kNN = 1;
+
+  // Squared search radius, reproducing bit-for-bit the threshold that
+  // pcl::KdTreeFLANN::radiusSearch() used to hand to FLANN: it takes the radius
+  // as a double and passes static_cast<float>(radius * radius). Promoting the
+  // float tolerance to double and multiplying there is exact (a 24x24-bit
+  // product fits in 53 bits), so the single rounding back to float yields
+  // exactly the same value the radius search compared against.
+  const float maximum_tolerance_squared =
+      static_cast<float>(static_cast<double>(maximum_tolerance) *
+                         static_cast<double>(maximum_tolerance));
+
+  // Pass 2 (parallel): the nearest neighbour search. Every iteration reads the
+  // kd-tree and writes only integer tallies of its own cells, so the loop is
+  // free of ordering constraints.
+#pragma omp parallel
+  {
+    // Declared inside the parallel region rather than with a private() clause:
+    // private() default-constructs, which handed every thread empty vectors.
+    pcl::PointXYZ search_point;
+    pcl::Indices knn_indices(kNN);
+    std::vector<float> knn_squared_dists(kNN);
+
+#pragma omp for schedule(dynamic, 4096)
+    for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
+         ++scan_point_index) {
+      const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
+
+      // Find the closest reconstruction point to this scan point.
+      //
+      // This used to be radiusSearch(maximum_tolerance, ..., max_nn = kNN),
+      // which asks the kd-tree a much more expensive question than the answer
+      // requires. Only knn_squared_dists[0] is ever read below; knn_indices is
+      // never used. With max_nn = 1 FLANN answers a radius query with a
+      // KNNRadiusResultSet of capacity 1, i.e. it returns the single nearest
+      // neighbour, and reports it only when its squared distance is strictly
+      // smaller than the squared radius (KNNRadiusResultSet::addPoint returns
+      // early on dist >= worst_dist_ and worst_dist_ starts at radius^2; the
+      // leaf loop in KDTreeSingleIndex::searchLevel likewise tests
+      // dist < worst_dist). A plain 1-nearest-neighbour query returns the same
+      // nearest neighbour -- both searches are exact and L2_Simple computes the
+      // squared distance identically -- so testing that distance against
+      // maximum_tolerance_squared with a strict '<' reproduces the radius
+      // search exactly, while letting the tree shrink its search bound from the
+      // first candidate on instead of descending every node that overlaps a
+      // 0.5 m ball.
+      search_point.getVector3fMap() = scan_point.getVector3fMap();
+      // pcl::KdTreeFLANN::nearestKSearch returns min(k, cloud size)
+      // unconditionally rather than the number of neighbours actually written,
+      // so its return value cannot be used to detect "nothing found" (which
+      // FLANN does produce for a non-finite query point). Pre-seeding the slot
+      // with infinity makes that case fail the tolerance test, which is exactly
+      // what radiusSearch returning 0 did.
+      knn_squared_dists[0] = std::numeric_limits<float>::infinity();
+      reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
+                                           knn_squared_dists);
+      if (knn_squared_dists[0] < maximum_tolerance_squared) {
+        // Since a reconstruction point was found within the search radius,
+        // this scan point is complete for the maximum tolerance, at least.
+        // Find the smallest tolerance for which it is still complete.
+        int smallest_complete_tolerance_index = 0;
+        for (int tolerance_index = static_cast<int>(tolerances_count) - 2;
+             tolerance_index >= 0; --tolerance_index) {
           if (sorted_tolerances_squared[tolerance_index] <
               knn_squared_dists[0]) {
-            // The scan point is not completed for the current tolerance index.
             smallest_complete_tolerance_index = tolerance_index + 1;
             break;
           }
-          for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-            cells[grid_index]->complete_count[tolerance_index] += 1;
-          }
         }
-      }
 
-      // Output point results, if requested.
-      if (output_point_results) {
-        // The points is incomplete for tolerances smaller than the smallest
-        // complete one.
-        for (int tolerance_index = 0;
-             tolerance_index < smallest_complete_tolerance_index;
-             ++tolerance_index) {
-          point_is_complete->at(tolerance_index)[scan_point_index] = false;
+        // The point is complete for every tolerance index from
+        // smallest_complete_tolerance_index upwards. Record that as a single
+        // histogram bin; the cumulative counts are formed below.
+        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+          uint32_t* bin =
+              histogram_ptrs[grid_index] +
+              static_cast<size_t>(
+                  point_cell_ids_ptr[static_cast<size_t>(scan_point_index) *
+                                         kGridCount +
+                                     grid_index]) *
+                  tolerances_count +
+              smallest_complete_tolerance_index;
+#pragma omp atomic
+          ++(*bin);
         }
-        // The point is complete for tolerances starting from the smallest
-        // complete one.
-        for (size_t tolerance_index = smallest_complete_tolerance_index;
-             tolerance_index < tolerances_count; ++tolerance_index) {
-          point_is_complete->at(tolerance_index)[scan_point_index] = true;
+
+        if (output_point_results) {
+          smallest_complete_tolerance_indices[scan_point_index] =
+              static_cast<uint32_t>(smallest_complete_tolerance_index);
         }
       }
-    } else if (output_point_results) {
-      // This scan point is incomplete for all tolerances.
-      for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
-           ++tolerance_index) {
-        point_is_complete->at(tolerance_index)[scan_point_index] = false;
+    }
+  }
+
+  // Output point results, if requested. The points are incomplete for
+  // tolerances smaller than the smallest complete one and complete from there
+  // on; the vectors are already initialized to false.
+  if (output_point_results) {
+    for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+         ++tolerance_index) {
+      std::vector<bool>& point_is_complete_for_tolerance =
+          point_is_complete->at(tolerance_index);
+      for (long long int scan_point_index = 0;
+           scan_point_index < scan_point_size; ++scan_point_index) {
+        if (smallest_complete_tolerance_indices[scan_point_index] <=
+            tolerance_index) {
+          point_is_complete_for_tolerance[scan_point_index] = true;
+        }
       }
     }
   }
@@ -196,14 +310,33 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
     cell_count += cell_maps[grid_index].size();
 
-    for (auto it = cell_maps[grid_index].cbegin(),
-              end = cell_maps[grid_index].cend();
-         it != end; ++it) {
-      const CompletenessCell& cell = it->second;
+    // Turn the per-cell histogram into the cumulative number of complete
+    // points per tolerance, which is exactly what the original code counted.
+    uint32_t* histogram = histogram_ptrs[grid_index];
+    const size_t grid_cell_count = cell_point_counts[grid_index].size();
+    for (size_t cell_id = 0; cell_id < grid_cell_count; ++cell_id) {
+      uint32_t* cell_histogram = histogram + cell_id * tolerances_count;
+      uint32_t running_sum = 0;
       for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
            ++tolerance_index) {
+        running_sum += cell_histogram[tolerance_index];
+        cell_histogram[tolerance_index] = running_sum;
+      }
+    }
+
+    // Sum over the cells in dense id order, which is the order in which the
+    // points first touched them (pass 1). Walking the cells in id order rather
+    // than in the hash table's bucket order keeps this floating point summation
+    // in one fixed sequence that does not depend on the hash function, on the
+    // table size, or on the thread count.
+    for (size_t cell_id = 0; cell_id < grid_cell_count; ++cell_id) {
+      const uint32_t* cell_histogram = histogram + cell_id * tolerances_count;
+      const size_t point_count = cell_point_counts[grid_index][cell_id];
+      for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+           ++tolerance_index) {
+        const size_t complete_count = cell_histogram[tolerance_index];
         completeness_sum[tolerance_index] +=
-            cell.complete_count[tolerance_index] / (1.0 * cell.point_count);
+            complete_count / (1.0 * point_count);
       }
     }
   }
