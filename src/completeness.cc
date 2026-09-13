@@ -26,6 +26,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <limits>
+
 #include "completeness.h"
 
 #include <pcl/common/transforms.h>
@@ -167,9 +169,15 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     // tree shrink its search bound from the first candidate on instead of
     // descending every node that overlaps a 0.5 m ball.
     search_point.getVector3fMap() = scan_point.getVector3fMap();
-    if (reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
-                                            knn_squared_dists) > 0 &&
-        knn_squared_dists[0] < maximum_tolerance_squared) {
+    // pcl::KdTreeFLANN::nearestKSearch returns min(k, cloud size) unconditionally
+    // rather than the number of neighbours actually written, so its return value
+    // cannot be used to detect "nothing found" (which FLANN does produce for a
+    // non-finite query point). Pre-seeding the slot with infinity makes that case
+    // fail the tolerance test, which is exactly what radiusSearch returning 0 did.
+    knn_squared_dists[0] = std::numeric_limits<float>::infinity();
+    reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
+                                         knn_squared_dists);
+    if (knn_squared_dists[0] < maximum_tolerance_squared) {
       int smallest_complete_tolerance_index = 0;
 #pragma omp critical
       {
