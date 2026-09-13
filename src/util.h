@@ -93,6 +93,13 @@ struct VoxelCellKey {
   int32_t z;
 };
 
+// Exact equality of the full key, as std::tuple's operator== was. Used by the
+// callers to short-circuit a repeated lookup of the cell the previous point
+// fell into; it can only skip a lookup that would have returned the same id.
+inline bool operator==(const VoxelCellKey& a, const VoxelCellKey& b) {
+  return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
 inline VoxelCellKey CalcCellCoordinates(
     const pcl::PointXYZ& point, float voxel_size_inv,
     float shift_x, float shift_y, float shift_z) {
