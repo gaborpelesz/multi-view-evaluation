@@ -1,9 +1,17 @@
-project(ETH3DMultiViewEvaluation)
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.16)
+project(ETH3DMultiViewEvaluation CXX)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
+# Settings. RelWithDebInfo (-O2 -g) is the canonical benchmark configuration:
+# it matches what benchmark/eth3d/multi-view-evaluation-compat.patch produces
+# and keeps frame pointers/line tables for the profiler.
+if(NOT CMAKE_BUILD_TYPE)
+  message(STATUS "Build type not specified, using RelWithDebInfo")
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
 
 # External dependency: boost filesystem
 find_package(Boost COMPONENTS filesystem system REQUIRED)
@@ -11,35 +19,18 @@ include_directories(${Boost_INCLUDE_DIRS})
 link_directories(${Boost_LIBRARY_DIRS})
 
 # External dependency: Eigen3
-find_package(Eigen3 REQUIRED)
-include_directories(${EIGEN3_INCLUDE_DIRS})
+find_package(Eigen3 REQUIRED CONFIG)
 
 # External dependency: PCL
-find_package(PCL 1.7 REQUIRED)
+find_package(PCL 1.7 REQUIRED COMPONENTS common io search kdtree)
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
 # OpenMP
-find_package(OpenMP)
-if (OPENMP_FOUND)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-endif()
+find_package(OpenMP REQUIRED)
 
-# Settings.
-if(NOT CMAKE_BUILD_TYPE)
-  message(STATUS "Build type not specified, using RelWithDebInfo")
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
-endif()
-
-if(NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
-    add_definitions("-O2 -msse2 -msse3 -std=c++11")
-endif()
-
-include_directories(
-    ./src
-)
+include_directories(./src)
 
 # Evaluation executable.
 add_executable(ETH3DMultiViewEvaluation
@@ -57,4 +48,6 @@ add_executable(ETH3DMultiViewEvaluation
 target_link_libraries(ETH3DMultiViewEvaluation
     ${PCL_LIBRARIES}
     ${Boost_LIBRARIES}
+    OpenMP::OpenMP_CXX
+    Eigen3::Eigen
 )
