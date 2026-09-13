@@ -38,6 +38,8 @@ add_executable(ETH3DMultiViewEvaluation
     src/accuracy.h
     src/completeness.cc
     src/completeness.h
+    src/fast_ply.cc
+    src/fast_ply.h
     src/main.cc
     src/meshlab_project.cc
     src/meshlab_project.h
