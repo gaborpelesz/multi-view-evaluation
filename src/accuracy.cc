@@ -28,6 +28,10 @@
 
 #include "accuracy.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
 #include <Eigen/StdVector>
 #include <pcl/io/ply_io.h>
 
@@ -47,15 +51,35 @@ typedef std::vector<Eigen::Matrix3f, Eigen::aligned_allocator<Eigen::Matrix3f>>
 typedef std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>
     Vector3fVector;
 
-// Accuracy results for one voxel cell.
-struct AccuracyCell {
-  inline AccuracyCell() : accurate_count(0), inaccurate_count(0) {}
+// Accuracy tallies for one differently-shifted voxel grid.
+//
+// This used to be std::unordered_map<std::tuple<int, int, int>,
+// std::vector<AccuracyCell>>, where every cell was a separately malloc'd hash
+// node holding a std::vector with a second malloc of its own. Here the cell
+// coordinates are resolved to a dense cell index by an open-addressing table
+// (VoxelCellIndexMap) and the per-tolerance tallies live in flat arrays
+// addressed by that index, so a cell costs no allocation of its own, a tally is
+// an indexed store into contiguous memory instead of a pointer chase, and --
+// because the tallies are plain integers outside the map -- they can be updated
+// with atomic increments from several threads.
+//
+// The counts themselves, and which cell each point lands in, are unchanged.
+// The dense index is handed out in first-touch order over the reconstruction
+// points, so iterating the indices in increasing order visits the cells in the
+// order in which they were created; the final floating point summation uses
+// that order.
+struct AccuracyCellGrid {
+  // Returns the dense index of the cell with the given coordinates, creating it
+  // if it does not exist yet.
+  inline uint32_t GetCell(const VoxelCellKey& key) {
+    bool inserted;
+    return map_.Lookup(key, &inserted);
+  }
 
-  // Number of accurate reconstruction points within this cell.
-  size_t accurate_count;
+  inline size_t cell_count() const { return map_.size(); }
 
-  // Number of inaccurate reconstruction points within this cell.
-  size_t inaccurate_count;
+ private:
+  VoxelCellIndexMap map_;
 };
 
 // Modulo which works properly for negative k (in contrast to C++' % operator),
@@ -107,10 +131,29 @@ struct SphericalPointAndDirection {
   float azimuth;
 };
 
-typedef std::vector<SphericalPointAndDirection> SphericalPointAndDirectionCloud;
+// The subset of SphericalPointAndDirection that ClassifyPoint actually reads,
+// stored by value inside the grid (see SphericalPointGrid). Keeping only these
+// 28 bytes per scan point, contiguously and in cell order, means the beam test
+// walks a cell's points sequentially with no indirection.
+struct GridScanPoint {
+  // Read for every candidate point (the beam test starts with this dot
+  // product), therefore placed first.
+  Eigen::Vector3f direction;
+  // Read only for points that fall inside the beam volume.
+  Eigen::Vector3f point;
+  float radius;
+};
 
-// Stores SphericalPointAndDirection in a grid defined on azimuth and
-// inclination for fast direction-based access.
+// Stores the scan points in a grid defined on azimuth and inclination for fast
+// direction-based access.
+//
+// The storage is a CSR / bucketed layout: one contiguous array of points in
+// cell order plus an offsets array of cell_count + 1 entries, so cell c owns
+// points_[cell_offsets_[c] .. cell_offsets_[c + 1]). This replaces a
+// std::vector<std::vector<SphericalPointAndDirection*>>, which cost a 24-byte
+// vector header for each of the 2,097,152 cells (~50 MB per scan before a
+// single point is stored), one heap allocation per non-empty cell, and two
+// pointer chases per visited point.
 class SphericalPointGrid {
   friend class SphericalPointGridIterator;
 
@@ -120,15 +163,10 @@ class SphericalPointGrid {
         cell_extent_azimuth_(2 * M_PI / cell_count_azimuth_),
         cell_count_inclination_(cell_count_inclination),
         cell_extent_inclination_(M_PI / cell_count_inclination) {
-    cells_.resize(cell_count_azimuth_ * cell_count_inclination_);
+    cell_offsets_.assign(
+        static_cast<size_t>(cell_count_azimuth_) * cell_count_inclination_ + 1,
+        0u);
   }
-
-  inline SphericalPointGrid(const SphericalPointGrid& other)
-      : cell_count_azimuth_(other.cell_count_azimuth_),
-        cell_extent_azimuth_(other.cell_extent_azimuth_),
-        cell_count_inclination_(other.cell_count_inclination_),
-        cell_extent_inclination_(other.cell_extent_inclination_),
-        cells_(other.cells_) {}
 
   inline void CellCoordinatesWithoutWrap(float azimuth, float inclination,
                                          int* cell_index_azimuth,
@@ -164,21 +202,90 @@ class SphericalPointGrid {
     return CellCoordinatesToIndex(cell_index_azimuth, cell_index_inclination);
   }
 
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      int cell_index) const {
-    return cells_[cell_index];
+  // Converts the given scan cloud to spherical coordinates and fills the grid
+  // with it.
+  //
+  // This is a counting sort of the points by cell index. Pass 1 converts each
+  // point and histograms the cells, the histogram is prefix-summed into the
+  // offsets array, and pass 2 scatters the points into the contiguous array.
+  // The scatter walks the points in increasing point index and appends to each
+  // cell's running cursor, so it is stable: within a cell, the points end up in
+  // increasing point index order, which is exactly the order the previous
+  // push_back-based construction produced. The order in which ClassifyPoint
+  // visits a cell's points is therefore unchanged.
+  //
+  // Only the conversion is parallel; the histogram, the prefix sum and the
+  // scatter stay serial and in increasing point index order, which is what
+  // makes the layout independent of the thread count.
+  void Build(const PointCloud& cartesian_cloud) {
+    const size_t point_count = cartesian_cloud.size();
+    const size_t cell_count = cell_offsets_.size() - 1;
+
+    // Scratch storage, freed before the next scan's grid is built.
+    std::vector<GridScanPoint> unsorted_points(point_count);
+    std::vector<uint32_t> point_cell_indices(point_count);
+
+    std::fill(cell_offsets_.begin(), cell_offsets_.end(), 0u);
+
+    // Pass 1a (parallel): spherical conversion and cell index. The conversion
+    // and the cell index computation are the unchanged original code, so every
+    // point lands in the same cell with the same field values as before, and
+    // every iteration writes only its own two elements.
+    const long long int signed_point_count =
+        static_cast<long long int>(point_count);
+#pragma omp parallel for schedule(static)
+    for (long long int p = 0; p < signed_point_count; ++p) {
+      const SphericalPointAndDirection spherical_point(
+          cartesian_cloud.at(p).getVector3fMap());
+
+      GridScanPoint& grid_point = unsorted_points[p];
+      grid_point.direction = spherical_point.direction;
+      grid_point.point = spherical_point.point;
+      grid_point.radius = spherical_point.radius;
+
+      point_cell_indices[p] = static_cast<uint32_t>(
+          CellIndex(spherical_point.azimuth, spherical_point.inclination));
+    }
+
+    // Pass 1b (serial): per-cell histogram.
+    for (size_t p = 0; p < point_count; ++p) {
+      ++cell_offsets_[point_cell_indices[p]];
+    }
+
+    // Exclusive prefix sum: cell_offsets_[c] becomes the start of cell c.
+    uint32_t running_offset = 0;
+    for (size_t c = 0; c < cell_count; ++c) {
+      const uint32_t count = cell_offsets_[c];
+      cell_offsets_[c] = running_offset;
+      running_offset += count;
+    }
+    cell_offsets_[cell_count] = running_offset;
+
+    // Pass 2: stable scatter. This consumes cell_offsets_[c], advancing it to
+    // the end of cell c.
+    points_.resize(point_count);
+    for (size_t p = 0; p < point_count; ++p) {
+      points_[cell_offsets_[point_cell_indices[p]]++] = unsorted_points[p];
+    }
+
+    // Shift the consumed cursors back into start-of-cell form. Afterwards
+    // cell_offsets_[c] is the start of cell c again, and the final entry still
+    // holds point_count (no point index can equal cell_count, so the scatter
+    // never touched it).
+    for (size_t c = cell_count; c > 0; --c) {
+      cell_offsets_[c] = cell_offsets_[c - 1];
+    }
+    cell_offsets_[0] = 0;
   }
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      float azimuth, float inclination) const {
-    return cells_[CellIndex(azimuth, inclination)];
+
+  // The contiguous point array. May be null for an empty scan, in which case
+  // every cell range is empty as well.
+  inline const GridScanPoint* points_data() const { return points_.data(); }
+  inline uint32_t cell_start(int cell_index) const {
+    return cell_offsets_[cell_index];
   }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      int cell_index) {
-    return &cells_[cell_index];
-  }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      float azimuth, float inclination) {
-    return &cells_[CellIndex(azimuth, inclination)];
+  inline uint32_t cell_end(int cell_index) const {
+    return cell_offsets_[cell_index + 1];
   }
 
  private:
@@ -187,11 +294,12 @@ class SphericalPointGrid {
   int cell_count_inclination_;
   float cell_extent_inclination_;
 
-  // Indexed by: [cell_index_azimuth + cell_count_azimuth *
-  //              cell_index_inclination][point_index] .
-  // The points are not owned and must remain valid for the lifetime of this
-  // object.
-  std::vector<std::vector<SphericalPointAndDirection*>> cells_;
+  // CSR layout of the scan points. cell_offsets_ has cell_count + 1 entries,
+  // indexed by [cell_index_azimuth + cell_count_azimuth *
+  // cell_index_inclination]; the points of that cell are
+  // points_[cell_offsets_[i] .. cell_offsets_[i + 1]).
+  std::vector<uint32_t> cell_offsets_;
+  std::vector<GridScanPoint> points_;
 };
 
 // Iterates over an azimuth-inclination range in a SphericalPointGrid.
@@ -310,12 +418,13 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
       &point_grid, spherical_reconstruction_point.azimuth,
       spherical_reconstruction_point.inclination, relevancy_angle_horizontal,
       relevancy_angle_vertical);
+  const GridScanPoint* grid_points = point_grid.points_data();
   while (it.Next()) {
-    const std::vector<SphericalPointAndDirection*>& cell_points =
-        point_grid.cell(it.cell_index());
-    for (size_t point_index = 0, point_count = cell_points.size();
-         point_index < point_count; ++point_index) {
-      SphericalPointAndDirection* scan_point = cell_points[point_index];
+    const int cell_index = it.cell_index();
+    const uint32_t cell_end = point_grid.cell_end(cell_index);
+    for (uint32_t point_index = point_grid.cell_start(cell_index);
+         point_index < cell_end; ++point_index) {
+      const GridScanPoint* scan_point = grid_points + point_index;
 
       // Is the reconstruction point within the beam volume? (Checked by testing
       // whether the scan ray is closer than beam_radius to the reconstruction
@@ -407,27 +516,13 @@ void ComputeAccuracy(
   }
 
   // Transform all scan points to spherical coordinates, and sort them into grid
-  // cells defined on the spherical coordinates.
-  std::vector<SphericalPointAndDirectionCloud> spherical_clouds(scan_count);
+  // cells defined on the spherical coordinates. The grid owns the points, so no
+  // separate spherical point cloud is kept alongside it.
   std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
   for (size_t scan_index = 0; scan_index < scan_count; ++scan_index) {
     point_grids[scan_index].reset(
         new SphericalPointGrid(kCellCountAzimuth, kCellCountInclination));
-
-    const PointCloud& cartesian_cloud = *scans[scan_index];
-    SphericalPointAndDirectionCloud* spherical_cloud =
-        &spherical_clouds[scan_index];
-    spherical_cloud->resize(cartesian_cloud.size());
-    for (size_t p = 0; p < cartesian_cloud.size(); ++p) {
-      const pcl::PointXYZ& cartesian_point = cartesian_cloud.at(p);
-      SphericalPointAndDirection* spherical_point = &spherical_cloud->at(p);
-      *spherical_point =
-          SphericalPointAndDirection(cartesian_point.getVector3fMap());
-
-      point_grids[scan_index]
-          ->cell_mutable(spherical_point->azimuth, spherical_point->inclination)
-          ->push_back(spherical_point);
-    }
+    point_grids[scan_index]->Build(*scans[scan_index]);
   }
 
   // Prepare point_is_accurate, if requested.
@@ -439,29 +534,104 @@ void ComputeAccuracy(
           .resize(reconstruction.size(), AccuracyResult::kUnobserved);
     }
   }
+  // std::vector<AccuracyResult> is a byte array, so different threads writing
+  // different point indices write to distinct memory locations.
+  std::vector<AccuracyResult*> point_results(tolerances_count, nullptr);
+  if (output_point_results) {
+    for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+         ++tolerance_index) {
+      point_results[tolerance_index] =
+          point_is_accurate->at(tolerance_index).data();
+    }
+  }
 
   // Differently shifted voxel grids.
-  // Indexed by: [map_index][CalcCellCoordinates(...)][tolerance_index].
-  std::unordered_map<std::tuple<int, int, int>, std::vector<AccuracyCell>>
-      cell_maps[kGridCount];
+  // Indexed by: [map_index], then by the dense cell index that the grid assigns
+  // to CalcCellCoordinates(...).
+  AccuracyCellGrid cell_maps[kGridCount];
 
-  // Loop over the reconstruction points.
-  for (size_t point_index = 0, size = reconstruction.size(); point_index < size;
+  const long long int reconstruction_size =
+      static_cast<long long int>(reconstruction.size());
+
+  // Pass 1 (serial): assign every reconstruction point the cell it falls into,
+  // in both voxel grids, walking the points in their original order. This
+  // creates exactly the cells the original implementation created, in exactly
+  // the same sequence, and VoxelCellIndexMap hands out its dense indices in
+  // that first-touch order -- so iterating the indices in increasing order at
+  // the end of this function visits the cells in creation order, and the order
+  // of the floating point summation over them is fixed and thread count
+  // independent. Only integer bookkeeping happens here; the expensive
+  // classification is done in pass 2, in parallel.
+  // Indexed by: [point_index * kGridCount + grid_index].
+  std::vector<uint32_t> point_cell_ids(
+      static_cast<size_t>(reconstruction_size) * kGridCount);
+  size_t grid_cell_counts[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    AccuracyCellGrid& grid = cell_maps[grid_index];
+    const float shift_x = kGridShifts[grid_index][0];
+    const float shift_y = kGridShifts[grid_index][1];
+    const float shift_z = kGridShifts[grid_index][2];
+
+    // Consecutive reconstruction points usually fall into the same voxel;
+    // remembering the previous key saves most of the lookups.
+    VoxelCellKey previous_key;
+    uint32_t previous_id = 0;
+    bool have_previous = false;
+
+    for (long long int point_index = 0; point_index < reconstruction_size;
+         ++point_index) {
+      const VoxelCellKey key =
+          CalcCellCoordinates(reconstruction.at(point_index), voxel_size_inv,
+                              shift_x, shift_y, shift_z);
+      uint32_t cell_id;
+      if (have_previous && key == previous_key) {
+        cell_id = previous_id;
+      } else {
+        cell_id = grid.GetCell(key);
+        previous_key = key;
+        previous_id = cell_id;
+        have_previous = true;
+      }
+      point_cell_ids[static_cast<size_t>(point_index) * kGridCount +
+                     grid_index] = cell_id;
+    }
+    grid_cell_counts[grid_index] = grid.cell_count();
+  }
+
+  // Histograms of the first tolerance index for which a reconstruction point
+  // is accurate, per cell; the second histogram counts only the points which
+  // additionally produced inaccurate classifications. Indexed by:
+  // [grid_index][cell_id * (tolerances_count + 1) +
+  //  aggregate_first_accurate_tolerance_index].
+  // After the parallel pass these are turned into the per-tolerance accurate
+  // and inaccurate counts in place, which is what the original code counted
+  // directly. Counting the histograms instead needs only two atomic increments
+  // per point and grid, independent of the number of tolerances.
+  const size_t histogram_stride = tolerances_count + 1;
+  std::vector<uint32_t> accurate_histograms[kGridCount];
+  std::vector<uint32_t> inaccurate_histograms[kGridCount];
+  uint32_t* accurate_histogram_ptrs[kGridCount];
+  uint32_t* inaccurate_histogram_ptrs[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    accurate_histograms[grid_index].assign(
+        grid_cell_counts[grid_index] * histogram_stride, 0);
+    inaccurate_histograms[grid_index].assign(
+        grid_cell_counts[grid_index] * histogram_stride, 0);
+    accurate_histogram_ptrs[grid_index] =
+        accurate_histograms[grid_index].data();
+    inaccurate_histogram_ptrs[grid_index] =
+        inaccurate_histograms[grid_index].data();
+  }
+  const uint32_t* point_cell_ids_ptr = point_cell_ids.data();
+
+  // Pass 2 (parallel): loop over the reconstruction points. Every iteration
+  // only reads the scan grids and writes integer tallies of its own cells plus
+  // its own entry of the per-point output, so the loop is free of ordering
+  // constraints.
+#pragma omp parallel for schedule(dynamic, 512)
+  for (long long int point_index = 0; point_index < reconstruction_size;
        ++point_index) {
     const pcl::PointXYZ& point = reconstruction.at(point_index);
-
-    // Find the voxels for this reconstruction point.
-    std::vector<AccuracyCell>* cell_vectors[kGridCount];
-    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      std::vector<AccuracyCell>* cell_vector =
-          &cell_maps[grid_index][CalcCellCoordinates(
-              point, voxel_size_inv, kGridShifts[grid_index][0],
-              kGridShifts[grid_index][1], kGridShifts[grid_index][2])];
-      if (cell_vector->empty()) {
-        cell_vector->resize(tolerances_count);
-      }
-      cell_vectors[grid_index] = cell_vector;
-    }
 
     int aggregate_first_accurate_tolerance_index =
         static_cast<int>(sorted_tolerances_squared.size());
@@ -512,56 +682,91 @@ void ComputeAccuracy(
       }
     }
 
-    // Aggregate accurate count.
-    for (int tolerance_index = aggregate_first_accurate_tolerance_index;
-         tolerance_index < static_cast<int>(tolerances_count);
-         ++tolerance_index) {
-      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-        ++cell_vectors[grid_index]->at(tolerance_index).accurate_count;
-      }
-      if (output_point_results) {
-        point_is_accurate->at(tolerance_index)[point_index] =
-            AccuracyResult::kAccurate;
+    // Tally the classification into both voxel grids. The point is accurate
+    // for every tolerance index from aggregate_first_accurate_tolerance_index
+    // upwards, and inaccurate for every smaller one if inaccurate
+    // classifications exist; both are recorded as a single histogram bin and
+    // accumulated into counts below.
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      const size_t bin_offset =
+          static_cast<size_t>(
+              point_cell_ids_ptr[static_cast<size_t>(point_index) * kGridCount +
+                                 grid_index]) *
+              histogram_stride +
+          aggregate_first_accurate_tolerance_index;
+      uint32_t* accurate_bin = accurate_histogram_ptrs[grid_index] + bin_offset;
+#pragma omp atomic
+      ++(*accurate_bin);
+      if (aggregate_inaccurate_classifications_exist) {
+        uint32_t* inaccurate_bin =
+            inaccurate_histogram_ptrs[grid_index] + bin_offset;
+#pragma omp atomic
+        ++(*inaccurate_bin);
       }
     }
-    // Aggregate inaccurate count or unobserved count.
-    if (aggregate_inaccurate_classifications_exist) {
-      for (int tolerance_index = aggregate_first_accurate_tolerance_index - 1;
-           tolerance_index >= 0; --tolerance_index) {
-        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-          ++cell_vectors[grid_index]->at(tolerance_index).inaccurate_count;
-        }
-        if (output_point_results) {
-          point_is_accurate->at(tolerance_index)[point_index] =
-              AccuracyResult::kInaccurate;
-        }
+
+    // Output point results, if requested. Entries below the first accurate
+    // tolerance index stay at their initial kUnobserved value unless
+    // inaccurate classifications exist.
+    if (output_point_results) {
+      for (int tolerance_index = aggregate_first_accurate_tolerance_index;
+           tolerance_index < static_cast<int>(tolerances_count);
+           ++tolerance_index) {
+        point_results[tolerance_index][point_index] = AccuracyResult::kAccurate;
       }
-    } else {
-      if (output_point_results) {
+      if (aggregate_inaccurate_classifications_exist) {
         for (int tolerance_index = aggregate_first_accurate_tolerance_index - 1;
              tolerance_index >= 0; --tolerance_index) {
-          point_is_accurate->at(tolerance_index)[point_index] =
-              AccuracyResult::kUnobserved;
+          point_results[tolerance_index][point_index] =
+              AccuracyResult::kInaccurate;
         }
       }
     }
   }
 
-  // Average results over all cells and fill the results vector.
+  // Average results over all cells and fill the results vector. The cells are
+  // visited in dense index order, i.e. in the order in which they were created
+  // in pass 1.
   std::vector<double> accuracy_sum(tolerances_count, 0.0);
   std::vector<size_t> valid_cell_count(tolerances_count, 0);
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    for (auto it = cell_maps[grid_index].cbegin(),
-              end = cell_maps[grid_index].cend();
-         it != end; ++it) {
-      const std::vector<AccuracyCell>& cell_vector = it->second;
+    uint32_t* accurate_histogram = accurate_histogram_ptrs[grid_index];
+    uint32_t* inaccurate_histogram = inaccurate_histogram_ptrs[grid_index];
+    const size_t grid_cell_count = grid_cell_counts[grid_index];
+    for (size_t cell_index = 0; cell_index < grid_cell_count; ++cell_index) {
+      // Turn the per-cell histograms into the per-tolerance accurate and
+      // inaccurate counts, which is exactly what the original code counted:
+      // accurate_count[t]   = number of points with first_accurate <= t
+      // inaccurate_count[t] = number of points with inaccurate classifications
+      //                       and first_accurate > t
+      uint32_t* accurate_counts =
+          accurate_histogram + cell_index * histogram_stride;
+      uint32_t running_sum = 0;
       for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
            ++tolerance_index) {
-        const AccuracyCell& cell = cell_vector[tolerance_index];
-        size_t valid_point_count = cell.accurate_count + cell.inaccurate_count;
+        running_sum += accurate_counts[tolerance_index];
+        accurate_counts[tolerance_index] = running_sum;
+      }
+
+      uint32_t* inaccurate_counts =
+          inaccurate_histogram + cell_index * histogram_stride;
+      running_sum = 0;
+      uint32_t carry = inaccurate_counts[tolerances_count];
+      for (int tolerance_index = static_cast<int>(tolerances_count) - 1;
+           tolerance_index >= 0; --tolerance_index) {
+        running_sum += carry;
+        carry = inaccurate_counts[tolerance_index];
+        inaccurate_counts[tolerance_index] = running_sum;
+      }
+
+      for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+           ++tolerance_index) {
+        const size_t accurate_count = accurate_counts[tolerance_index];
+        const size_t inaccurate_count = inaccurate_counts[tolerance_index];
+        size_t valid_point_count = accurate_count + inaccurate_count;
         if (valid_point_count > 0) {
           accuracy_sum[tolerance_index] +=
-              cell.accurate_count / (1.0f * valid_point_count);
+              accurate_count / (1.0f * valid_point_count);
           ++valid_cell_count[tolerance_index];
         }
       }

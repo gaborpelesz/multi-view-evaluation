@@ -33,6 +33,7 @@
 
 #include "accuracy.h"
 #include "completeness.h"
+#include "fast_ply.h"
 #include "meshlab_project.h"
 #include "util.h"
 
@@ -135,7 +136,10 @@ int main(int argc, char** argv) {
   std::cout << "Loading reconstruction: " << reconstruction_ply_path
             << std::endl;
   PointCloudPtr reconstruction(new PointCloud());
-  if (pcl::io::loadPLYFile(reconstruction_ply_path, *reconstruction) < 0) {
+  // The fast path handles plain binary_little_endian float x/y/z files and
+  // produces a bit-identical cloud; everything else falls back to PCL.
+  if (!fast_ply::LoadBinaryXyzPly(reconstruction_ply_path, reconstruction.get()) &&
+      pcl::io::loadPLYFile(reconstruction_ply_path, *reconstruction) < 0) {
     std::cerr << "Cannot read reconstruction file." << std::endl;
     return static_cast<int>(ReturnCodes::kReconstructionFileInputFailure);
   }
@@ -153,7 +157,8 @@ int main(int argc, char** argv) {
 
     std::cout << "Loading scan: " << file_path << std::endl;
     PointCloudPtr point_cloud(new PointCloud());
-    if (pcl::io::loadPLYFile(file_path, *point_cloud) < 0) {
+    if (!fast_ply::LoadBinaryXyzPly(file_path, point_cloud.get()) &&
+        pcl::io::loadPLYFile(file_path, *point_cloud) < 0) {
       std::cerr << "Cannot read scan file." << std::endl;
       return static_cast<int>(ReturnCodes::kSystemFailure);
     }
