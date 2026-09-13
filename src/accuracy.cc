@@ -28,6 +28,9 @@
 
 #include "accuracy.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include <Eigen/StdVector>
 #include <pcl/io/ply_io.h>
 
@@ -107,10 +110,29 @@ struct SphericalPointAndDirection {
   float azimuth;
 };
 
-typedef std::vector<SphericalPointAndDirection> SphericalPointAndDirectionCloud;
+// The subset of SphericalPointAndDirection that ClassifyPoint actually reads,
+// stored by value inside the grid (see SphericalPointGrid). Keeping only these
+// 28 bytes per scan point, contiguously and in cell order, means the beam test
+// walks a cell's points sequentially with no indirection.
+struct GridScanPoint {
+  // Read for every candidate point (the beam test starts with this dot
+  // product), therefore placed first.
+  Eigen::Vector3f direction;
+  // Read only for points that fall inside the beam volume.
+  Eigen::Vector3f point;
+  float radius;
+};
 
-// Stores SphericalPointAndDirection in a grid defined on azimuth and
-// inclination for fast direction-based access.
+// Stores the scan points in a grid defined on azimuth and inclination for fast
+// direction-based access.
+//
+// The storage is a CSR / bucketed layout: one contiguous array of points in
+// cell order plus an offsets array of cell_count + 1 entries, so cell c owns
+// points_[cell_offsets_[c] .. cell_offsets_[c + 1]). This replaces a
+// std::vector<std::vector<SphericalPointAndDirection*>>, which cost a 24-byte
+// vector header for each of the 2,097,152 cells (~50 MB per scan before a
+// single point is stored), one heap allocation per non-empty cell, and two
+// pointer chases per visited point.
 class SphericalPointGrid {
   friend class SphericalPointGridIterator;
 
@@ -120,15 +142,10 @@ class SphericalPointGrid {
         cell_extent_azimuth_(2 * M_PI / cell_count_azimuth_),
         cell_count_inclination_(cell_count_inclination),
         cell_extent_inclination_(M_PI / cell_count_inclination) {
-    cells_.resize(cell_count_azimuth_ * cell_count_inclination_);
+    cell_offsets_.assign(
+        static_cast<size_t>(cell_count_azimuth_) * cell_count_inclination_ + 1,
+        0u);
   }
-
-  inline SphericalPointGrid(const SphericalPointGrid& other)
-      : cell_count_azimuth_(other.cell_count_azimuth_),
-        cell_extent_azimuth_(other.cell_extent_azimuth_),
-        cell_count_inclination_(other.cell_count_inclination_),
-        cell_extent_inclination_(other.cell_extent_inclination_),
-        cells_(other.cells_) {}
 
   inline void CellCoordinatesWithoutWrap(float azimuth, float inclination,
                                          int* cell_index_azimuth,
@@ -164,21 +181,79 @@ class SphericalPointGrid {
     return CellCoordinatesToIndex(cell_index_azimuth, cell_index_inclination);
   }
 
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      int cell_index) const {
-    return cells_[cell_index];
+  // Converts the given scan cloud to spherical coordinates and fills the grid
+  // with it.
+  //
+  // This is a counting sort of the points by cell index. Pass 1 converts each
+  // point and histograms the cells, the histogram is prefix-summed into the
+  // offsets array, and pass 2 scatters the points into the contiguous array.
+  // The scatter walks the points in increasing point index and appends to each
+  // cell's running cursor, so it is stable: within a cell, the points end up in
+  // increasing point index order, which is exactly the order the previous
+  // push_back-based construction produced. The order in which ClassifyPoint
+  // visits a cell's points is therefore unchanged.
+  void Build(const PointCloud& cartesian_cloud) {
+    const size_t point_count = cartesian_cloud.size();
+    const size_t cell_count = cell_offsets_.size() - 1;
+
+    // Scratch storage, freed before the next scan's grid is built.
+    std::vector<GridScanPoint> unsorted_points(point_count);
+    std::vector<uint32_t> point_cell_indices(point_count);
+
+    std::fill(cell_offsets_.begin(), cell_offsets_.end(), 0u);
+
+    // Pass 1: spherical conversion and per-cell histogram. The conversion and
+    // the cell index computation are the unchanged original code, so every
+    // point lands in the same cell with the same field values as before.
+    for (size_t p = 0; p < point_count; ++p) {
+      const SphericalPointAndDirection spherical_point(
+          cartesian_cloud.at(p).getVector3fMap());
+
+      GridScanPoint& grid_point = unsorted_points[p];
+      grid_point.direction = spherical_point.direction;
+      grid_point.point = spherical_point.point;
+      grid_point.radius = spherical_point.radius;
+
+      const uint32_t cell_index = static_cast<uint32_t>(
+          CellIndex(spherical_point.azimuth, spherical_point.inclination));
+      point_cell_indices[p] = cell_index;
+      ++cell_offsets_[cell_index];
+    }
+
+    // Exclusive prefix sum: cell_offsets_[c] becomes the start of cell c.
+    uint32_t running_offset = 0;
+    for (size_t c = 0; c < cell_count; ++c) {
+      const uint32_t count = cell_offsets_[c];
+      cell_offsets_[c] = running_offset;
+      running_offset += count;
+    }
+    cell_offsets_[cell_count] = running_offset;
+
+    // Pass 2: stable scatter. This consumes cell_offsets_[c], advancing it to
+    // the end of cell c.
+    points_.resize(point_count);
+    for (size_t p = 0; p < point_count; ++p) {
+      points_[cell_offsets_[point_cell_indices[p]]++] = unsorted_points[p];
+    }
+
+    // Shift the consumed cursors back into start-of-cell form. Afterwards
+    // cell_offsets_[c] is the start of cell c again, and the final entry still
+    // holds point_count (no point index can equal cell_count, so the scatter
+    // never touched it).
+    for (size_t c = cell_count; c > 0; --c) {
+      cell_offsets_[c] = cell_offsets_[c - 1];
+    }
+    cell_offsets_[0] = 0;
   }
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      float azimuth, float inclination) const {
-    return cells_[CellIndex(azimuth, inclination)];
+
+  // The contiguous point array. May be null for an empty scan, in which case
+  // every cell range is empty as well.
+  inline const GridScanPoint* points_data() const { return points_.data(); }
+  inline uint32_t cell_start(int cell_index) const {
+    return cell_offsets_[cell_index];
   }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      int cell_index) {
-    return &cells_[cell_index];
-  }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      float azimuth, float inclination) {
-    return &cells_[CellIndex(azimuth, inclination)];
+  inline uint32_t cell_end(int cell_index) const {
+    return cell_offsets_[cell_index + 1];
   }
 
  private:
@@ -187,11 +262,12 @@ class SphericalPointGrid {
   int cell_count_inclination_;
   float cell_extent_inclination_;
 
-  // Indexed by: [cell_index_azimuth + cell_count_azimuth *
-  //              cell_index_inclination][point_index] .
-  // The points are not owned and must remain valid for the lifetime of this
-  // object.
-  std::vector<std::vector<SphericalPointAndDirection*>> cells_;
+  // CSR layout of the scan points. cell_offsets_ has cell_count + 1 entries,
+  // indexed by [cell_index_azimuth + cell_count_azimuth *
+  // cell_index_inclination]; the points of that cell are
+  // points_[cell_offsets_[i] .. cell_offsets_[i + 1]).
+  std::vector<uint32_t> cell_offsets_;
+  std::vector<GridScanPoint> points_;
 };
 
 // Iterates over an azimuth-inclination range in a SphericalPointGrid.
@@ -310,12 +386,13 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
       &point_grid, spherical_reconstruction_point.azimuth,
       spherical_reconstruction_point.inclination, relevancy_angle_horizontal,
       relevancy_angle_vertical);
+  const GridScanPoint* grid_points = point_grid.points_data();
   while (it.Next()) {
-    const std::vector<SphericalPointAndDirection*>& cell_points =
-        point_grid.cell(it.cell_index());
-    for (size_t point_index = 0, point_count = cell_points.size();
-         point_index < point_count; ++point_index) {
-      SphericalPointAndDirection* scan_point = cell_points[point_index];
+    const int cell_index = it.cell_index();
+    const uint32_t cell_end = point_grid.cell_end(cell_index);
+    for (uint32_t point_index = point_grid.cell_start(cell_index);
+         point_index < cell_end; ++point_index) {
+      const GridScanPoint* scan_point = grid_points + point_index;
 
       // Is the reconstruction point within the beam volume? (Checked by testing
       // whether the scan ray is closer than beam_radius to the reconstruction
@@ -407,27 +484,13 @@ void ComputeAccuracy(
   }
 
   // Transform all scan points to spherical coordinates, and sort them into grid
-  // cells defined on the spherical coordinates.
-  std::vector<SphericalPointAndDirectionCloud> spherical_clouds(scan_count);
+  // cells defined on the spherical coordinates. The grid owns the points, so no
+  // separate spherical point cloud is kept alongside it.
   std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
   for (size_t scan_index = 0; scan_index < scan_count; ++scan_index) {
     point_grids[scan_index].reset(
         new SphericalPointGrid(kCellCountAzimuth, kCellCountInclination));
-
-    const PointCloud& cartesian_cloud = *scans[scan_index];
-    SphericalPointAndDirectionCloud* spherical_cloud =
-        &spherical_clouds[scan_index];
-    spherical_cloud->resize(cartesian_cloud.size());
-    for (size_t p = 0; p < cartesian_cloud.size(); ++p) {
-      const pcl::PointXYZ& cartesian_point = cartesian_cloud.at(p);
-      SphericalPointAndDirection* spherical_point = &spherical_cloud->at(p);
-      *spherical_point =
-          SphericalPointAndDirection(cartesian_point.getVector3fMap());
-
-      point_grids[scan_index]
-          ->cell_mutable(spherical_point->azimuth, spherical_point->inclination)
-          ->push_back(spherical_point);
-    }
+    point_grids[scan_index]->Build(*scans[scan_index]);
   }
 
   // Prepare point_is_accurate, if requested.
