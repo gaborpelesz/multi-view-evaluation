@@ -112,11 +112,25 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   std::vector<int> knn_indices(kNN);
   std::vector<float> knn_squared_dists(kNN);
 
+  // Squared search radius, reproducing bit-for-bit the threshold that
+  // pcl::KdTreeFLANN::radiusSearch() used to hand to FLANN: it takes the radius
+  // as a double and passes static_cast<float>(radius * radius). Promoting the
+  // float tolerance to double and multiplying there is exact (a 24x24-bit
+  // product fits in 53 bits), so the single rounding back to float yields
+  // exactly the same value the radius search compared against.
+  const float maximum_tolerance_squared =
+      static_cast<float>(static_cast<double>(maximum_tolerance) *
+                         static_cast<double>(maximum_tolerance));
+
   const long long int scan_point_size =
       static_cast<long long int>(scan->size());
 
 // Loop over all scan points.
-#pragma omp parallel for private(search_point, knn_indices, knn_squared_dists)
+// knn_indices / knn_squared_dists are firstprivate rather than private so that
+// each thread starts with a copy that is already sized kNN; private would
+// default-construct empty vectors that the search has to grow on first use.
+#pragma omp parallel for private(search_point) \
+    firstprivate(knn_indices, knn_squared_dists)
   for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
        ++scan_point_index) {
     const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
@@ -135,12 +149,27 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
       cells[grid_index] = cell;
     }
 
-    // Find the closest reconstruction point to this scan point, limited to the
-    // maximum evaluation tolerance for efficiency.
+    // Find the closest reconstruction point to this scan point.
+    //
+    // This used to be radiusSearch(maximum_tolerance, ..., max_nn = kNN), which
+    // asks the kd-tree a much more expensive question than the answer requires.
+    // Only knn_squared_dists[0] is ever read below; knn_indices is never used.
+    // With max_nn = 1 FLANN answers a radius query with a KNNRadiusResultSet of
+    // capacity 1, i.e. it returns the single nearest neighbour, and reports it
+    // only when its squared distance is strictly smaller than the squared
+    // radius (KNNRadiusResultSet::addPoint returns early on dist >= worst_dist_
+    // and worst_dist_ starts at radius^2; the leaf loop in
+    // KDTreeSingleIndex::searchLevel likewise tests dist < worst_dist). A plain
+    // 1-nearest-neighbour query returns the same nearest neighbour -- both
+    // searches are exact and L2_Simple computes the squared distance
+    // identically -- so testing that distance against maximum_tolerance_squared
+    // with a strict '<' reproduces the radius search exactly, while letting the
+    // tree shrink its search bound from the first candidate on instead of
+    // descending every node that overlaps a 0.5 m ball.
     search_point.getVector3fMap() = scan_point.getVector3fMap();
-    if (reconstruction_kdtree.radiusSearch(search_point, maximum_tolerance,
-                                           knn_indices, knn_squared_dists,
-                                           kNN) > 0) {
+    if (reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
+                                            knn_squared_dists) > 0 &&
+        knn_squared_dists[0] < maximum_tolerance_squared) {
       int smallest_complete_tolerance_index = 0;
 #pragma omp critical
       {
