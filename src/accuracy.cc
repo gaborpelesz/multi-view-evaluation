@@ -26,10 +26,41 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+
 #include "accuracy.h"
+
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <vector>
 
 #include <Eigen/StdVector>
 #include <pcl/io/ply_io.h>
+
+// ---------------------------------------------------------------------------
+// SIMD kernel selection.
+//
+// The innermost loop of ComputeAccuracy() tests candidate scan points against
+// the laser beam cone of a reconstruction point. It is implemented three times
+// -- AVX2, NEON and portable -- with an identical structure, and all three are
+// only ever used as a *conservative rejection filter*: a candidate that the
+// filter does not reject is re-evaluated by EvaluateCandidateExact(), which
+// contains the unmodified upstream Eigen arithmetic. The filter therefore
+// cannot influence the result, only how much work is skipped. See
+// ComputeBeamFilter() for the error bound that makes the rejection safe.
+// ---------------------------------------------------------------------------
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define ETH3D_CLASSIFY_LANES 8
+#define ETH3D_CLASSIFY_ISA "avx2"
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#define ETH3D_CLASSIFY_LANES 4
+#define ETH3D_CLASSIFY_ISA "neon"
+#else
+#define ETH3D_CLASSIFY_LANES 4
+#define ETH3D_CLASSIFY_ISA "portable"
+#endif
 
 // Number of cells used for the spatial access structure in inclination and
 // azimuth directions.
@@ -82,6 +113,8 @@ struct SphericalPoint {
 
 // Represents a point in spherical coordinates, and in addition to
 // SphericalPoint also stores the normalized direction vector to the point.
+// Used while building ScanPointGrid; the grid stores the resulting floats in
+// its own layout and does not keep these objects.
 struct SphericalPointAndDirection {
   inline SphericalPointAndDirection() {}
   inline SphericalPointAndDirection(const Eigen::Vector3f& p) : point(p) {
@@ -107,28 +140,75 @@ struct SphericalPointAndDirection {
   float azimuth;
 };
 
-typedef std::vector<SphericalPointAndDirection> SphericalPointAndDirectionCloud;
-
-// Stores SphericalPointAndDirection in a grid defined on azimuth and
-// inclination for fast direction-based access.
-class SphericalPointGrid {
-  friend class SphericalPointGridIterator;
-
+// Stores the scan points of one ground truth scan in a grid defined on azimuth
+// and inclination for fast direction-based access.
+//
+// Layout: the points are stored once, sorted by grid cell, in two flat arrays;
+// cell_start_ gives the half-open index range of each cell. This replaces the
+// upstream std::vector<std::vector<SphericalPointAndDirection*>>, which needed
+// a 24-byte std::vector header per cell (50 MB for the 2,097,152 cells of one
+// scan, touched at random) plus a pointer indirection into a separate
+// array-of-structs for every candidate point. Here a cell lookup touches two
+// adjacent uint32 (8.4 MB per scan), and the candidates of a whole azimuth run
+// are contiguous, which is what makes the blocked SIMD filter possible at all.
+//
+//   directions_[3 * i + {0,1,2}]  normalized direction to scan point i
+//   points_[4 * i + {0,1,2}]      position of scan point i
+//   points_[4 * i + 3]            distance of scan point i from the scanner
+//
+// directions_ is kept separate from points_ because the filter only reads
+// directions; positions and radii are read for the (few) candidates that
+// survive the filter.
+class ScanPointGrid {
  public:
-  inline SphericalPointGrid(int cell_count_azimuth, int cell_count_inclination)
+  inline ScanPointGrid(int cell_count_azimuth, int cell_count_inclination)
       : cell_count_azimuth_(cell_count_azimuth),
         cell_extent_azimuth_(2 * M_PI / cell_count_azimuth_),
         cell_count_inclination_(cell_count_inclination),
-        cell_extent_inclination_(M_PI / cell_count_inclination) {
-    cells_.resize(cell_count_azimuth_ * cell_count_inclination_);
-  }
+        cell_extent_inclination_(M_PI / cell_count_inclination),
+        cell_count_(static_cast<size_t>(cell_count_azimuth) *
+                    static_cast<size_t>(cell_count_inclination)) {}
 
-  inline SphericalPointGrid(const SphericalPointGrid& other)
-      : cell_count_azimuth_(other.cell_count_azimuth_),
-        cell_extent_azimuth_(other.cell_extent_azimuth_),
-        cell_count_inclination_(other.cell_count_inclination_),
-        cell_extent_inclination_(other.cell_extent_inclination_),
-        cells_(other.cells_) {}
+  // Bins the given scan into the grid. Byte-identical to the upstream binning:
+  // the same SphericalPointAndDirection values are computed and the same
+  // CellIndex() decides the cell; only the storage layout differs.
+  void Build(const PointCloud& cloud) {
+    const size_t point_count = cloud.size();
+
+    std::vector<SphericalPointAndDirection> spherical_points(point_count);
+    std::vector<uint32_t> cell_of_point(point_count);
+    cell_start_.assign(cell_count_ + 1, 0u);
+
+    for (size_t p = 0; p < point_count; ++p) {
+      spherical_points[p] =
+          SphericalPointAndDirection(cloud.at(p).getVector3fMap());
+      const uint32_t cell_index = static_cast<uint32_t>(CellIndex(
+          spherical_points[p].azimuth, spherical_points[p].inclination));
+      cell_of_point[p] = cell_index;
+      ++cell_start_[cell_index + 1];
+    }
+    for (size_t cell = 0; cell < cell_count_; ++cell) {
+      cell_start_[cell + 1] += cell_start_[cell];
+    }
+
+    directions_.assign(3 * point_count, 0.f);
+    points_.assign(4 * point_count, 0.f);
+
+    // Counting sort into the flat arrays. Points keep their relative order
+    // within a cell, which is the order upstream's push_back() produced.
+    std::vector<uint32_t> cursor(cell_start_.begin(), cell_start_.end() - 1);
+    for (size_t p = 0; p < point_count; ++p) {
+      const size_t target = cursor[cell_of_point[p]]++;
+      const SphericalPointAndDirection& sp = spherical_points[p];
+      directions_[3 * target + 0] = sp.direction.x();
+      directions_[3 * target + 1] = sp.direction.y();
+      directions_[3 * target + 2] = sp.direction.z();
+      points_[4 * target + 0] = sp.point.x();
+      points_[4 * target + 1] = sp.point.y();
+      points_[4 * target + 2] = sp.point.z();
+      points_[4 * target + 3] = sp.radius;
+    }
+  }
 
   inline void CellCoordinatesWithoutWrap(float azimuth, float inclination,
                                          int* cell_index_azimuth,
@@ -164,91 +244,322 @@ class SphericalPointGrid {
     return CellCoordinatesToIndex(cell_index_azimuth, cell_index_inclination);
   }
 
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      int cell_index) const {
-    return cells_[cell_index];
-  }
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      float azimuth, float inclination) const {
-    return cells_[CellIndex(azimuth, inclination)];
-  }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      int cell_index) {
-    return &cells_[cell_index];
-  }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      float azimuth, float inclination) {
-    return &cells_[CellIndex(azimuth, inclination)];
-  }
+  inline int cell_count_azimuth() const { return cell_count_azimuth_; }
+
+  // First / one-past-last point index of the run of cells
+  // [first_cell, last_cell] (which must lie within one inclination row).
+  inline uint32_t run_begin(int cell) const { return cell_start_[cell]; }
+  inline uint32_t run_end(int cell) const { return cell_start_[cell + 1]; }
+
+  inline const float* directions() const { return directions_.data(); }
+  inline const float* points() const { return points_.data(); }
 
  private:
   int cell_count_azimuth_;
   float cell_extent_azimuth_;
   int cell_count_inclination_;
   float cell_extent_inclination_;
+  size_t cell_count_;
 
-  // Indexed by: [cell_index_azimuth + cell_count_azimuth *
-  //              cell_index_inclination][point_index] .
-  // The points are not owned and must remain valid for the lifetime of this
-  // object.
-  std::vector<std::vector<SphericalPointAndDirection*>> cells_;
+  // Indexed by cell index; size cell_count_ + 1.
+  std::vector<uint32_t> cell_start_;
+  std::vector<float> directions_;
+  std::vector<float> points_;
 };
 
-// Iterates over an azimuth-inclination range in a SphericalPointGrid.
-class SphericalPointGridIterator {
- public:
-  inline SphericalPointGridIterator(const SphericalPointGrid* grid,
-                                    float azimuth, float inclination,
-                                    float azimuth_angle,
-                                    float inclination_angle)
-      : grid_(grid) {
-    grid_->CellCoordinatesWithoutWrap(
-        azimuth - azimuth_angle, inclination - inclination_angle,
-        &min_cell_index_azimuth_, &min_cell_index_inclination_);
-    grid_->CellCoordinatesWithoutWrap(
-        azimuth + azimuth_angle, inclination + inclination_angle,
-        &max_cell_index_azimuth_, &max_cell_index_inclination_);
+// Everything the SIMD filter needs about the reconstruction point under test.
+struct BeamFilter {
+  // The reconstruction point, in the coordinate frame of the scan.
+  float rx, ry, rz;
+  // A candidate may be rejected outright if its signed distance along the scan
+  // ray is below this value (see ComputeBeamFilter()).
+  float min_signed_distance;
+  // ... or if its squared distance to the scan ray is above this value.
+  float max_ray_distance_squared;
+};
 
-    current_cell_index_azimuth_ = min_cell_index_azimuth_ - 1;
-    current_cell_index_inclination_ = min_cell_index_inclination_;
+// Derives the conservative rejection thresholds for one reconstruction point.
+//
+// WHY THIS IS EXACT. The filter computes an approximation s~ of the signed
+// distance along the ray and an approximation d2~ of the squared distance to
+// the ray. It may use a different association and FMA contraction than the
+// scalar code, so s~ and d2~ are not bit-identical to the scalar s and d2 --
+// they are only close. The filter is therefore used in one direction only: it
+// rejects a candidate when the bounds below prove that the *scalar* code would
+// also have rejected it. Anything else is handed to EvaluateCandidateExact(),
+// which recomputes s and d2 with the unmodified upstream expressions and makes
+// the actual decision. Both thresholds use comparisons that are false for NaN,
+// so a NaN anywhere sends the candidate down the exact path as well.
+//
+// The bounds, with u = 2^-24 the float unit roundoff and A = |rx|+|ry|+|rz|:
+//   * |s~ - s| <= 6.2 u A  (two 3-term dot products of a unit direction with
+//     the point, each with error <= 3.1 u sum|d_i r_i| <= 3.1 u A). The
+//     threshold uses 1e-6 A > 3.7e-7 A, a factor 2.7 of slack.
+//   * the vector r - s d differs between the two evaluations by at most
+//     1e-6 A + 5.5 u A < 1.33e-6 A; the threshold uses 2e-6 A.
+//   * d2~ and d2 each carry a relative error <= 3u, absorbed by the 1.0001
+//     factor, which is 10x the 1e-5 that the derivation needs.
+// Hence d2~ > max_ray_distance_squared implies scalar d2 > beam_radius_squared,
+// and s~ < min_signed_distance implies scalar s < 0.
+inline BeamFilter ComputeBeamFilter(
+    const Eigen::Vector3f& cartesian_reconstruction_point, float beam_radius) {
+  BeamFilter filter;
+  filter.rx = cartesian_reconstruction_point.x();
+  filter.ry = cartesian_reconstruction_point.y();
+  filter.rz = cartesian_reconstruction_point.z();
+
+  const float l1_norm = std::fabs(filter.rx) + std::fabs(filter.ry) +
+                        std::fabs(filter.rz);
+  const float signed_distance_error = 1e-6f * l1_norm + 1e-25f;
+  const float ray_offset_error = 2e-6f * l1_norm + 1e-25f;
+
+  filter.min_signed_distance = -signed_distance_error;
+  const float max_ray_distance = (beam_radius + ray_offset_error) * 1.0001f;
+  filter.max_ray_distance_squared = max_ray_distance * max_ray_distance;
+  return filter;
+}
+
+// ---------------------------------------------------------------------------
+// The blocked filter kernel: three implementations, identical structure.
+//
+// Input:  ETH3D_CLASSIFY_LANES consecutive scan point directions, interleaved
+//         as x,y,z (this is what makes the NEON de-interleaving load free).
+// Output: a bit mask whose bit k is set iff lane k could not be rejected and
+//         must be evaluated exactly.
+// ---------------------------------------------------------------------------
+#if defined(__AVX2__) && defined(__FMA__)
+
+// De-interleaves 4 xyz triples held in three 128-bit registers.
+//   v0 = [x0 y0 z0 x1], v1 = [y1 z1 x2 y2], v2 = [z2 x3 y3 z3]
+inline void Deinterleave3x4(__m128 v0, __m128 v1, __m128 v2, __m128* x,
+                            __m128* y, __m128* z) {
+  // [x0 x1 x2 x2] then overwrite lane 3 with v2[1] = x3.
+  __m128 tx = _mm_shuffle_ps(v0, v1, _MM_SHUFFLE(2, 2, 3, 0));
+  *x = _mm_insert_ps(tx, v2, _MM_MK_INSERTPS_NDX(1, 3, 0));
+  // [y0 y0 y1 y2] -> [y0 y1 y2 y2] then overwrite lane 3 with v2[2] = y3.
+  __m128 ty = _mm_shuffle_ps(v0, v1, _MM_SHUFFLE(3, 0, 1, 1));
+  ty = _mm_shuffle_ps(ty, ty, _MM_SHUFFLE(3, 3, 2, 0));
+  *y = _mm_insert_ps(ty, v2, _MM_MK_INSERTPS_NDX(2, 3, 0));
+  // [z0 z0 z1 z1] -> [z0 z1 z2 z3].
+  __m128 tz = _mm_shuffle_ps(v0, v1, _MM_SHUFFLE(1, 1, 2, 2));
+  *z = _mm_shuffle_ps(tz, v2, _MM_SHUFFLE(3, 0, 2, 0));
+}
+
+inline unsigned FilterCandidateBlock(const float* interleaved_directions,
+                                     const BeamFilter& filter) {
+  __m128 lo_x, lo_y, lo_z, hi_x, hi_y, hi_z;
+  Deinterleave3x4(_mm_loadu_ps(interleaved_directions + 0),
+                  _mm_loadu_ps(interleaved_directions + 4),
+                  _mm_loadu_ps(interleaved_directions + 8), &lo_x, &lo_y,
+                  &lo_z);
+  Deinterleave3x4(_mm_loadu_ps(interleaved_directions + 12),
+                  _mm_loadu_ps(interleaved_directions + 16),
+                  _mm_loadu_ps(interleaved_directions + 20), &hi_x, &hi_y,
+                  &hi_z);
+  const __m256 dx = _mm256_set_m128(hi_x, lo_x);
+  const __m256 dy = _mm256_set_m128(hi_y, lo_y);
+  const __m256 dz = _mm256_set_m128(hi_z, lo_z);
+
+  const __m256 rx = _mm256_set1_ps(filter.rx);
+  const __m256 ry = _mm256_set1_ps(filter.ry);
+  const __m256 rz = _mm256_set1_ps(filter.rz);
+
+  // s = dot(direction, reconstruction point).
+  const __m256 s = _mm256_fmadd_ps(
+      dz, rz, _mm256_fmadd_ps(dy, ry, _mm256_mul_ps(dx, rx)));
+  // offset = reconstruction point - s * direction.
+  const __m256 ex = _mm256_fnmadd_ps(s, dx, rx);
+  const __m256 ey = _mm256_fnmadd_ps(s, dy, ry);
+  const __m256 ez = _mm256_fnmadd_ps(s, dz, rz);
+  const __m256 d2 = _mm256_fmadd_ps(
+      ez, ez, _mm256_fmadd_ps(ey, ey, _mm256_mul_ps(ex, ex)));
+
+  const __m256 rejected = _mm256_or_ps(
+      _mm256_cmp_ps(s, _mm256_set1_ps(filter.min_signed_distance),
+                    _CMP_LT_OQ),
+      _mm256_cmp_ps(d2, _mm256_set1_ps(filter.max_ray_distance_squared),
+                    _CMP_GT_OQ));
+  return (~static_cast<unsigned>(_mm256_movemask_ps(rejected))) & 0xffu;
+}
+
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+
+inline unsigned FilterCandidateBlock(const float* interleaved_directions,
+                                     const BeamFilter& filter) {
+  // vld3q_f32 de-interleaves 4 xyz triples in the load itself.
+  const float32x4x3_t d = vld3q_f32(interleaved_directions);
+  const float32x4_t dx = d.val[0];
+  const float32x4_t dy = d.val[1];
+  const float32x4_t dz = d.val[2];
+
+  const float32x4_t rx = vdupq_n_f32(filter.rx);
+  const float32x4_t ry = vdupq_n_f32(filter.ry);
+  const float32x4_t rz = vdupq_n_f32(filter.rz);
+
+  // s = dot(direction, reconstruction point).
+  const float32x4_t s =
+      vfmaq_f32(vfmaq_f32(vmulq_f32(dx, rx), dy, ry), dz, rz);
+  // offset = reconstruction point - s * direction.
+  const float32x4_t ex = vfmsq_f32(rx, s, dx);
+  const float32x4_t ey = vfmsq_f32(ry, s, dy);
+  const float32x4_t ez = vfmsq_f32(rz, s, dz);
+  const float32x4_t d2 =
+      vfmaq_f32(vfmaq_f32(vmulq_f32(ex, ex), ey, ey), ez, ez);
+
+  const uint32x4_t rejected = vorrq_u32(
+      vcltq_f32(s, vdupq_n_f32(filter.min_signed_distance)),
+      vcgtq_f32(d2, vdupq_n_f32(filter.max_ray_distance_squared)));
+  static const uint32_t kLaneBits[4] = {1u, 2u, 4u, 8u};
+  return vaddvq_u32(
+      vandq_u32(vmvnq_u32(rejected), vld1q_u32(kLaneBits)));
+}
+
+#else
+
+inline unsigned FilterCandidateBlock(const float* interleaved_directions,
+                                     const BeamFilter& filter) {
+  float dx[ETH3D_CLASSIFY_LANES], dy[ETH3D_CLASSIFY_LANES],
+      dz[ETH3D_CLASSIFY_LANES], s[ETH3D_CLASSIFY_LANES],
+      d2[ETH3D_CLASSIFY_LANES];
+  for (int lane = 0; lane < ETH3D_CLASSIFY_LANES; ++lane) {
+    dx[lane] = interleaved_directions[3 * lane + 0];
+    dy[lane] = interleaved_directions[3 * lane + 1];
+    dz[lane] = interleaved_directions[3 * lane + 2];
   }
+  for (int lane = 0; lane < ETH3D_CLASSIFY_LANES; ++lane) {
+    // s = dot(direction, reconstruction point).
+    s[lane] = dx[lane] * filter.rx + dy[lane] * filter.ry +
+              dz[lane] * filter.rz;
+  }
+  for (int lane = 0; lane < ETH3D_CLASSIFY_LANES; ++lane) {
+    // offset = reconstruction point - s * direction.
+    const float ex = filter.rx - s[lane] * dx[lane];
+    const float ey = filter.ry - s[lane] * dy[lane];
+    const float ez = filter.rz - s[lane] * dz[lane];
+    d2[lane] = ex * ex + ey * ey + ez * ez;
+  }
+  unsigned mask = 0;
+  for (int lane = 0; lane < ETH3D_CLASSIFY_LANES; ++lane) {
+    const bool rejected = (s[lane] < filter.min_signed_distance) ||
+                          (d2[lane] > filter.max_ray_distance_squared);
+    mask |= static_cast<unsigned>(!rejected) << lane;
+  }
+  return mask;
+}
 
-  inline bool Next() {
-    ++current_cell_index_azimuth_;
-    if (current_cell_index_azimuth_ > max_cell_index_azimuth_) {
-      current_cell_index_azimuth_ = min_cell_index_azimuth_;
-      ++current_cell_index_inclination_;
-      return current_cell_index_inclination_ <= max_cell_index_inclination_;
+#endif
+
+// Tests one candidate scan point against the reconstruction point, using the
+// unmodified upstream arithmetic. Returns true if the caller must exit early
+// because the point is accurate for the smallest tolerance.
+inline bool EvaluateCandidateExact(
+    const float* direction_xyz, const float* point_xyz_radius,
+    const Eigen::Vector3f& cartesian_reconstruction_point,
+    // Must be sorted in increasing order.
+    const std::vector<float>& accuracy_tolerances_squared,
+    float beam_radius_squared, int* first_accurate_tolerance_index,
+    bool* inaccurate_classifications_exist) {
+  const Eigen::Vector3f scan_point_direction(direction_xyz[0],
+                                             direction_xyz[1],
+                                             direction_xyz[2]);
+
+  // Is the reconstruction point within the beam volume? (Checked by testing
+  // whether the scan ray is closer than beam_radius to the reconstruction
+  // point).
+  float signed_distance_along_ray =
+      scan_point_direction.dot(cartesian_reconstruction_point);
+  if (signed_distance_along_ray < 0) {
+    // Treat points on the opposite side of the scan ray as unobserved.
+    return false;
+  }
+  Eigen::Vector3f closest_point_on_scan_ray =
+      signed_distance_along_ray * scan_point_direction;
+  float scan_ray_distance_squared =
+      (cartesian_reconstruction_point - closest_point_on_scan_ray)
+          .squaredNorm();
+  if (scan_ray_distance_squared <= beam_radius_squared) {
+    const Eigen::Vector3f scan_point_position(
+        point_xyz_radius[0], point_xyz_radius[1], point_xyz_radius[2]);
+
+    // Is the reconstruction point within the region for accurate
+    // classification (i.e., closer to the scan point than the evaluation
+    // threshold)? In this case, early exit with accurate classification.
+    float distance_from_scan_point_squared =
+        (scan_point_position - cartesian_reconstruction_point).squaredNorm();
+    for (size_t tolerance_index = 0;
+         tolerance_index < accuracy_tolerances_squared.size() &&
+         static_cast<int>(tolerance_index) < *first_accurate_tolerance_index;
+         ++tolerance_index) {
+      if (distance_from_scan_point_squared <=
+          accuracy_tolerances_squared[tolerance_index]) {
+        *first_accurate_tolerance_index = tolerance_index;
+        if (tolerance_index == 0) {
+          // Early exit.
+          return true;
+        }
+        break;
+      }
     }
-    return true;
+
+    // Is the reconstruction point in front of the scan point? In this case,
+    // remember that inaccurate classifications may exist.
+    if (signed_distance_along_ray < point_xyz_radius[3]) {
+      *inaccurate_classifications_exist = true;
+    }
   }
+  return false;
+}
 
-  inline int cell_index() const {
-    return grid_->CellCoordinatesToIndex(
-        mod(current_cell_index_azimuth_, grid_->cell_count_azimuth_),
-        current_cell_index_inclination_);
+// Classifies the reconstruction point against the contiguous run of scan
+// points [begin, end). Whole blocks go through the SIMD rejection filter;
+// the remainder is evaluated exactly right away, which is cheaper than
+// filtering it first. Returns true if the caller must exit early.
+inline bool ClassifyAgainstRun(
+    const ScanPointGrid& point_grid, uint32_t begin, uint32_t end,
+    const Eigen::Vector3f& cartesian_reconstruction_point,
+    const BeamFilter& filter,
+    // Must be sorted in increasing order.
+    const std::vector<float>& accuracy_tolerances_squared,
+    float beam_radius_squared, int* first_accurate_tolerance_index,
+    bool* inaccurate_classifications_exist) {
+  const float* directions = point_grid.directions();
+  const float* points = point_grid.points();
+
+  uint32_t index = begin;
+  for (; index + ETH3D_CLASSIFY_LANES <= end;
+       index += ETH3D_CLASSIFY_LANES) {
+    unsigned surviving_lanes =
+        FilterCandidateBlock(directions + 3 * static_cast<size_t>(index),
+                             filter);
+    while (surviving_lanes != 0) {
+      const unsigned lane = __builtin_ctz(surviving_lanes);
+      surviving_lanes &= surviving_lanes - 1;
+      const size_t candidate = static_cast<size_t>(index) + lane;
+      if (EvaluateCandidateExact(directions + 3 * candidate,
+                                 points + 4 * candidate,
+                                 cartesian_reconstruction_point,
+                                 accuracy_tolerances_squared,
+                                 beam_radius_squared,
+                                 first_accurate_tolerance_index,
+                                 inaccurate_classifications_exist)) {
+        return true;
+      }
+    }
   }
-
-  inline int min_cell_index_azimuth() const { return min_cell_index_azimuth_; }
-  inline int max_cell_index_azimuth() const { return max_cell_index_azimuth_; }
-  inline int min_cell_index_inclination() const {
-    return min_cell_index_inclination_;
+  for (; index < end; ++index) {
+    const size_t candidate = index;
+    if (EvaluateCandidateExact(directions + 3 * candidate,
+                               points + 4 * candidate,
+                               cartesian_reconstruction_point,
+                               accuracy_tolerances_squared,
+                               beam_radius_squared,
+                               first_accurate_tolerance_index,
+                               inaccurate_classifications_exist)) {
+      return true;
+    }
   }
-  inline int max_cell_index_inclination() const {
-    return max_cell_index_inclination_;
-  }
-
- private:
-  int current_cell_index_azimuth_;
-  int current_cell_index_inclination_;
-
-  int min_cell_index_azimuth_;
-  int max_cell_index_azimuth_;
-  int min_cell_index_inclination_;
-  int max_cell_index_inclination_;
-
-  const SphericalPointGrid* grid_;
-};
+  return false;
+}
 
 // Classifies a point as accurate, inaccurate, or unobserved given a single
 // scan point cloud. This function makes use of the following: If a
@@ -271,7 +582,7 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
                           const std::vector<float>& accuracy_tolerances_squared,
                           float beam_start_radius,
                           float tan_beam_divergence_halfangle_rad,
-                          const SphericalPointGrid& point_grid,
+                          const ScanPointGrid& point_grid,
                           int* first_accurate_tolerance_index,
                           bool* inaccurate_classifications_exist) {
   *first_accurate_tolerance_index = accuracy_tolerances_squared.size();
@@ -305,59 +616,76 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
 
   // Intersect the bounding box with the grid cells in which the scan points are
   // stored, handling wrap-around of the spherical coordinates in the horizontal
-  // direction.
-  SphericalPointGridIterator it(
-      &point_grid, spherical_reconstruction_point.azimuth,
-      spherical_reconstruction_point.inclination, relevancy_angle_horizontal,
-      relevancy_angle_vertical);
-  while (it.Next()) {
-    const std::vector<SphericalPointAndDirection*>& cell_points =
-        point_grid.cell(it.cell_index());
-    for (size_t point_index = 0, point_count = cell_points.size();
-         point_index < point_count; ++point_index) {
-      SphericalPointAndDirection* scan_point = cell_points[point_index];
+  // direction. This visits exactly the cells that upstream's
+  // SphericalPointGridIterator visited (a cell that the iterator visited twice,
+  // which only happens when the azimuth range covers the full circle, is
+  // visited once here -- the two results this function computes are a minimum
+  // and a logical or, so a repeated cell cannot change them).
+  int min_cell_index_azimuth, max_cell_index_azimuth;
+  int min_cell_index_inclination, max_cell_index_inclination;
+  point_grid.CellCoordinatesWithoutWrap(
+      spherical_reconstruction_point.azimuth - relevancy_angle_horizontal,
+      spherical_reconstruction_point.inclination - relevancy_angle_vertical,
+      &min_cell_index_azimuth, &min_cell_index_inclination);
+  point_grid.CellCoordinatesWithoutWrap(
+      spherical_reconstruction_point.azimuth + relevancy_angle_horizontal,
+      spherical_reconstruction_point.inclination + relevancy_angle_vertical,
+      &max_cell_index_azimuth, &max_cell_index_inclination);
 
-      // Is the reconstruction point within the beam volume? (Checked by testing
-      // whether the scan ray is closer than beam_radius to the reconstruction
-      // point).
-      float signed_distance_along_ray =
-          scan_point->direction.dot(cartesian_reconstruction_point);
-      if (signed_distance_along_ray < 0) {
-        // Treat points on the opposite side of the scan ray as unobserved.
+  const BeamFilter filter =
+      ComputeBeamFilter(cartesian_reconstruction_point, beam_radius);
+
+  const int cell_count_azimuth = point_grid.cell_count_azimuth();
+  const int azimuth_cell_count =
+      max_cell_index_azimuth - min_cell_index_azimuth + 1;
+
+  for (int cell_index_inclination = min_cell_index_inclination;
+       cell_index_inclination <= max_cell_index_inclination;
+       ++cell_index_inclination) {
+    const int row_first_cell = cell_count_azimuth * cell_index_inclination;
+
+    // The scan points of consecutive azimuth cells of one inclination row are
+    // consecutive in the grid's flat arrays, so the whole row range is a single
+    // run of points -- two runs if it wraps around the +-pi discontinuity.
+    int run_first_azimuth[2];
+    int run_last_azimuth[2];
+    int run_count;
+    if (azimuth_cell_count >= cell_count_azimuth) {
+      // The range covers the full circle.
+      run_first_azimuth[0] = 0;
+      run_last_azimuth[0] = cell_count_azimuth - 1;
+      run_count = 1;
+    } else {
+      const int first = mod(min_cell_index_azimuth, cell_count_azimuth);
+      const int last = first + azimuth_cell_count - 1;
+      if (last < cell_count_azimuth) {
+        run_first_azimuth[0] = first;
+        run_last_azimuth[0] = last;
+        run_count = 1;
+      } else {
+        run_first_azimuth[0] = first;
+        run_last_azimuth[0] = cell_count_azimuth - 1;
+        run_first_azimuth[1] = 0;
+        run_last_azimuth[1] = last - cell_count_azimuth;
+        run_count = 2;
+      }
+    }
+
+    for (int run = 0; run < run_count; ++run) {
+      const uint32_t begin =
+          point_grid.run_begin(row_first_cell + run_first_azimuth[run]);
+      const uint32_t end =
+          point_grid.run_end(row_first_cell + run_last_azimuth[run]);
+      if (begin == end) {
         continue;
       }
-      Eigen::Vector3f closest_point_on_scan_ray =
-          signed_distance_along_ray * scan_point->direction;
-      float scan_ray_distance_squared =
-          (cartesian_reconstruction_point - closest_point_on_scan_ray)
-              .squaredNorm();
-      if (scan_ray_distance_squared <= beam_radius_squared) {
-        // Is the reconstruction point within the region for accurate
-        // classification (i.e., closer to the scan point than the evaluation
-        // threshold)? In this case, early exit with accurate classification.
-        float distance_from_scan_point_squared =
-            (scan_point->point - cartesian_reconstruction_point).squaredNorm();
-        for (size_t tolerance_index = 0;
-             tolerance_index < accuracy_tolerances_squared.size() &&
-             static_cast<int>(tolerance_index) <
-                 *first_accurate_tolerance_index;
-             ++tolerance_index) {
-          if (distance_from_scan_point_squared <=
-              accuracy_tolerances_squared[tolerance_index]) {
-            *first_accurate_tolerance_index = tolerance_index;
-            if (tolerance_index == 0) {
-              // Early exit.
-              return;
-            }
-            break;
-          }
-        }
-
-        // Is the reconstruction point in front of the scan point? In this case,
-        // remember that inaccurate classifications may exist.
-        if (signed_distance_along_ray < scan_point->radius) {
-          *inaccurate_classifications_exist = true;
-        }
+      if (ClassifyAgainstRun(point_grid, begin, end,
+                             cartesian_reconstruction_point, filter,
+                             accuracy_tolerances_squared, beam_radius_squared,
+                             first_accurate_tolerance_index,
+                             inaccurate_classifications_exist)) {
+        // Early exit: the point is accurate for the smallest tolerance.
+        return;
       }
     }
   }
@@ -408,26 +736,11 @@ void ComputeAccuracy(
 
   // Transform all scan points to spherical coordinates, and sort them into grid
   // cells defined on the spherical coordinates.
-  std::vector<SphericalPointAndDirectionCloud> spherical_clouds(scan_count);
-  std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
+  std::vector<std::unique_ptr<ScanPointGrid>> point_grids(scan_count);
   for (size_t scan_index = 0; scan_index < scan_count; ++scan_index) {
     point_grids[scan_index].reset(
-        new SphericalPointGrid(kCellCountAzimuth, kCellCountInclination));
-
-    const PointCloud& cartesian_cloud = *scans[scan_index];
-    SphericalPointAndDirectionCloud* spherical_cloud =
-        &spherical_clouds[scan_index];
-    spherical_cloud->resize(cartesian_cloud.size());
-    for (size_t p = 0; p < cartesian_cloud.size(); ++p) {
-      const pcl::PointXYZ& cartesian_point = cartesian_cloud.at(p);
-      SphericalPointAndDirection* spherical_point = &spherical_cloud->at(p);
-      *spherical_point =
-          SphericalPointAndDirection(cartesian_point.getVector3fMap());
-
-      point_grids[scan_index]
-          ->cell_mutable(spherical_point->azimuth, spherical_point->inclination)
-          ->push_back(spherical_point);
-    }
+        new ScanPointGrid(kCellCountAzimuth, kCellCountInclination));
+    point_grids[scan_index]->Build(*scans[scan_index]);
   }
 
   // Prepare point_is_accurate, if requested.
@@ -484,7 +797,7 @@ void ComputeAccuracy(
           cartesian_reconstruction_point);
 
       // Classify it.
-      SphericalPointGrid* point_grid = point_grids[scan_index].get();
+      const ScanPointGrid* point_grid = point_grids[scan_index].get();
       int first_accurate_tolerance_index;
       bool inaccurate_classifications_exist;
       float radius_horizontal = sqrtf(cartesian_reconstruction_point.x() *
@@ -580,6 +893,7 @@ void ComputeAccuracy(
     }
   }
 }
+
 
 void WriteAccuracyVisualization(
     const std::string& base_path, const PointCloud& reconstruction,
