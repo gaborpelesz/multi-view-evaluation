@@ -61,6 +61,43 @@ struct AccuracyCell {
   size_t inaccurate_count;
 };
 
+// Accuracy results for one differently-shifted voxel grid.
+//
+// This used to be std::unordered_map<std::tuple<int, int, int>,
+// std::vector<AccuracyCell>>, where every cell was a separately malloc'd hash
+// node holding a std::vector with a second malloc of its own. Here the cell
+// coordinates are resolved to a dense cell index by an open-addressing table
+// (VoxelCellIndexMap) and the per-tolerance cells live in one flat array, so a
+// cell costs no allocation of its own and a tally is an indexed store into
+// contiguous memory instead of a pointer chase.
+//
+// The counts themselves, and which cell each point lands in, are unchanged.
+struct AccuracyCellGrid {
+  inline void Init(size_t tolerances_count) {
+    tolerances_count_ = tolerances_count;
+  }
+
+  // Returns the dense index of the cell with the given coordinates, creating it
+  // with zeroed counters if it does not exist yet.
+  inline uint32_t GetCell(const VoxelCellKey& key) {
+    bool inserted;
+    const uint32_t cell_index = map_.Lookup(key, &inserted);
+    if (inserted) {
+      cells.resize(cells.size() + tolerances_count_);
+    }
+    return cell_index;
+  }
+
+  inline size_t cell_count() const { return map_.size(); }
+
+  // Indexed by: [cell_index * tolerances_count + tolerance_index].
+  std::vector<AccuracyCell> cells;
+
+ private:
+  VoxelCellIndexMap map_;
+  size_t tolerances_count_ = 0;
+};
+
 // Modulo which works properly for negative k (in contrast to C++' % operator),
 // for example, mod(-2, 10) returns 8 instead of -2.
 inline int mod(int k, int n) { return ((k %= n) < 0) ? k + n : k; }
@@ -504,26 +541,33 @@ void ComputeAccuracy(
   }
 
   // Differently shifted voxel grids.
-  // Indexed by: [map_index][CalcCellCoordinates(...)][tolerance_index].
-  std::unordered_map<std::tuple<int, int, int>, std::vector<AccuracyCell>>
-      cell_maps[kGridCount];
+  // Indexed by: [map_index], then by the dense cell index that the grid assigns
+  // to CalcCellCoordinates(...), then by [tolerance_index].
+  AccuracyCellGrid cell_maps[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    cell_maps[grid_index].Init(tolerances_count);
+  }
 
   // Loop over the reconstruction points.
   for (size_t point_index = 0, size = reconstruction.size(); point_index < size;
        ++point_index) {
     const pcl::PointXYZ& point = reconstruction.at(point_index);
 
-    // Find the voxels for this reconstruction point.
-    std::vector<AccuracyCell>* cell_vectors[kGridCount];
+    // Find the voxels for this reconstruction point. All cells are resolved
+    // before any pointer into the flat arrays is taken, because creating a cell
+    // in one grid may reallocate that grid's array.
+    uint32_t cell_indices[kGridCount];
     for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      std::vector<AccuracyCell>* cell_vector =
-          &cell_maps[grid_index][CalcCellCoordinates(
+      cell_indices[grid_index] =
+          cell_maps[grid_index].GetCell(CalcCellCoordinates(
               point, voxel_size_inv, kGridShifts[grid_index][0],
-              kGridShifts[grid_index][1], kGridShifts[grid_index][2])];
-      if (cell_vector->empty()) {
-        cell_vector->resize(tolerances_count);
-      }
-      cell_vectors[grid_index] = cell_vector;
+              kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
+    }
+    AccuracyCell* cell_vectors[kGridCount];
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      cell_vectors[grid_index] =
+          &cell_maps[grid_index].cells[cell_indices[grid_index] *
+                                       tolerances_count];
     }
 
     int aggregate_first_accurate_tolerance_index =
@@ -580,7 +624,7 @@ void ComputeAccuracy(
          tolerance_index < static_cast<int>(tolerances_count);
          ++tolerance_index) {
       for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-        ++cell_vectors[grid_index]->at(tolerance_index).accurate_count;
+        ++cell_vectors[grid_index][tolerance_index].accurate_count;
       }
       if (output_point_results) {
         point_is_accurate->at(tolerance_index)[point_index] =
@@ -592,7 +636,7 @@ void ComputeAccuracy(
       for (int tolerance_index = aggregate_first_accurate_tolerance_index - 1;
            tolerance_index >= 0; --tolerance_index) {
         for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-          ++cell_vectors[grid_index]->at(tolerance_index).inaccurate_count;
+          ++cell_vectors[grid_index][tolerance_index].inaccurate_count;
         }
         if (output_point_results) {
           point_is_accurate->at(tolerance_index)[point_index] =
@@ -614,10 +658,11 @@ void ComputeAccuracy(
   std::vector<double> accuracy_sum(tolerances_count, 0.0);
   std::vector<size_t> valid_cell_count(tolerances_count, 0);
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    for (auto it = cell_maps[grid_index].cbegin(),
-              end = cell_maps[grid_index].cend();
-         it != end; ++it) {
-      const std::vector<AccuracyCell>& cell_vector = it->second;
+    const AccuracyCellGrid& grid = cell_maps[grid_index];
+    for (size_t cell_index = 0, grid_cell_count = grid.cell_count();
+         cell_index < grid_cell_count; ++cell_index) {
+      const AccuracyCell* cell_vector =
+          &grid.cells[cell_index * tolerances_count];
       for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
            ++tolerance_index) {
         const AccuracyCell& cell = cell_vector[tolerance_index];

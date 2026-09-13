@@ -37,17 +37,48 @@
 const int kGridCount = 2;
 const float kGridShifts[kGridCount][3] = {{0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}};
 
-// Completeness results for one voxel cell.
-struct CompletenessCell {
-  inline CompletenessCell() : point_count(0) {}
+// Completeness results for one differently-shifted voxel grid.
+//
+// This used to be std::unordered_map<std::tuple<int, int, int>,
+// CompletenessCell>, where every cell was a separately malloc'd hash node whose
+// CompletenessCell in turn owned a std::vector<size_t> with a second malloc of
+// its own. Here the cell coordinates are resolved to a dense cell index by an
+// open-addressing table (VoxelCellIndexMap) and the counters live in two flat
+// arrays, so a cell costs no allocation of its own and a tally is an indexed
+// store into contiguous memory instead of a pointer chase.
+//
+// The counts themselves, and which cell each point lands in, are unchanged.
+struct CompletenessCellGrid {
+  inline void Init(size_t tolerances_count) {
+    tolerances_count_ = tolerances_count;
+  }
 
-  // Number of scan points within this cell.
-  size_t point_count;
+  // Returns the dense index of the cell with the given coordinates, creating it
+  // with zeroed counters if it does not exist yet.
+  inline uint32_t GetCell(const VoxelCellKey& key) {
+    bool inserted;
+    const uint32_t cell_index = map_.Lookup(key, &inserted);
+    if (inserted) {
+      point_count.push_back(0);
+      complete_count.resize(complete_count.size() + tolerances_count_, 0);
+    }
+    return cell_index;
+  }
+
+  inline size_t cell_count() const { return map_.size(); }
+
+  // Number of scan points within a cell.
+  // Indexed by: [cell_index].
+  std::vector<size_t> point_count;
 
   // Number of complete scan points (smaller or equal to point_count), for each
   // tolerance value.
-  // Indexed by: [tolerance_index].
+  // Indexed by: [cell_index * tolerances_count + tolerance_index].
   std::vector<size_t> complete_count;
+
+ private:
+  VoxelCellIndexMap map_;
+  size_t tolerances_count_ = 0;
 };
 
 void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
@@ -106,9 +137,12 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   reconstruction_kdtree.setInputCloud(reconstruction);
 
   // Differently shifted voxel grids.
-  // Indexed by: [map_index][CalcCellCoordinates(...)].
-  std::unordered_map<std::tuple<int, int, int>, CompletenessCell>
-      cell_maps[kGridCount];
+  // Indexed by: [map_index], then by the dense cell index that the grid assigns
+  // to CalcCellCoordinates(...).
+  CompletenessCellGrid cell_maps[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    cell_maps[grid_index].Init(tolerances_count);
+  }
 
   const int kNN = 1;
   std::vector<int> knn_indices(kNN);
@@ -138,17 +172,18 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
 
     // Find the voxels for this scan point and increase their point count.
-    CompletenessCell* cells[kGridCount];
+    // Dense cell indices are remembered rather than pointers: the flat counter
+    // arrays may be reallocated by an insertion from another iteration, while
+    // the index of an existing cell never changes.
+    uint32_t cell_indices[kGridCount];
 #pragma omp critical
     for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      CompletenessCell* cell = &cell_maps[grid_index][CalcCellCoordinates(
-          scan_point, voxel_size_inv, kGridShifts[grid_index][0],
-          kGridShifts[grid_index][1], kGridShifts[grid_index][2])];
-      ++cell->point_count;
-      if (cell->complete_count.empty()) {
-        cell->complete_count.resize(tolerances_count, 0);
-      }
-      cells[grid_index] = cell;
+      const uint32_t cell_index =
+          cell_maps[grid_index].GetCell(CalcCellCoordinates(
+              scan_point, voxel_size_inv, kGridShifts[grid_index][0],
+              kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
+      ++cell_maps[grid_index].point_count[cell_index];
+      cell_indices[grid_index] = cell_index;
     }
 
     // Find the closest reconstruction point to this scan point.
@@ -184,7 +219,9 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
         // Since a reconstruction point was found within the search radius, this
         // scan point is complete for the maximum tolerance, at least.
         for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-          cells[grid_index]->complete_count[tolerances_count - 1] += 1;
+          cell_maps[grid_index]
+              .complete_count[cell_indices[grid_index] * tolerances_count +
+                              tolerances_count - 1] += 1;
         }
 
         // Next, find the smallest tolerance for which it is still complete.
@@ -197,7 +234,9 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
             break;
           }
           for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-            cells[grid_index]->complete_count[tolerance_index] += 1;
+            cell_maps[grid_index]
+                .complete_count[cell_indices[grid_index] * tolerances_count +
+                                tolerance_index] += 1;
           }
         }
       }
@@ -231,16 +270,18 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   std::vector<double> completeness_sum(tolerances_count, 0.0);
   size_t cell_count = 0;
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    cell_count += cell_maps[grid_index].size();
+    const CompletenessCellGrid& grid = cell_maps[grid_index];
+    const size_t grid_cell_count = grid.cell_count();
+    cell_count += grid_cell_count;
 
-    for (auto it = cell_maps[grid_index].cbegin(),
-              end = cell_maps[grid_index].cend();
-         it != end; ++it) {
-      const CompletenessCell& cell = it->second;
+    for (size_t cell_index = 0; cell_index < grid_cell_count; ++cell_index) {
+      const size_t cell_point_count = grid.point_count[cell_index];
+      const size_t* cell_complete_count =
+          &grid.complete_count[cell_index * tolerances_count];
       for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
            ++tolerance_index) {
         completeness_sum[tolerance_index] +=
-            cell.complete_count[tolerance_index] / (1.0 * cell.point_count);
+            cell_complete_count[tolerance_index] / (1.0 * cell_point_count);
       }
     }
   }
