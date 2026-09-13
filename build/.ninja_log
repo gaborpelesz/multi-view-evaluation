@@ -1,0 +1,10 @@
+# ninja log v7
+2	258	1789316475591044624	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/tinyxml2.cpp.o	90931cf7bf022ef8
+2	533	1789316475590936458	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/meshlab_project.cc.o	b552567fa9878601
+2	1606	1789316475590829542	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/main.cc.o	9b2c8c61cabe074f
+2	1740	1789316475590710668	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/completeness.cc.o	8d466bfb81f37b03
+2	1742	1789316475590511919	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/accuracy.cc.o	900fd933a325f3f2
+1742	1815	1789316477330350377	ETH3DMultiViewEvaluation	39ec42ae3f64110a
+6	1469	1789316501077695266	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/main.cc.o	9b2c8c61cabe074f
+6	1602	1789316501077401560	CMakeFiles/ETH3DMultiViewEvaluation.dir/src/completeness.cc.o	8d466bfb81f37b03
+1602	1674	1789316502673499134	ETH3DMultiViewEvaluation	39ec42ae3f64110a

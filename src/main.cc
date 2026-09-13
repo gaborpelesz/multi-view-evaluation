@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
   // Process arguments.
   std::sort(tolerances.begin(), tolerances.end());
   float tan_beam_divergence_halfangle_rad =
-      tan(kDegToRadFactor * beam_divergence_halfangle_deg);
+      1.02f * tan(kDegToRadFactor * beam_divergence_halfangle_deg);
   float voxel_size_inv = 1.0 / voxel_size;
 
   // Load the ground truth point cloud poses from the MeshLab project file.

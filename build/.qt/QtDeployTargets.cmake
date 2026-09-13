@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_ETH3DMultiViewEvaluation_FILE /Users/gaborpelesz/Desktop/elte-thesis-2026/mve-opt-worktrees/_negctl/build/ETH3DMultiViewEvaluation)
+set(__QT_DEPLOY_TARGET_ETH3DMultiViewEvaluation_TYPE EXECUTABLE)
