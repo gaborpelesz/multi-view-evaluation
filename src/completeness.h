@@ -44,7 +44,13 @@
 // thread, builds them in parallel, and prunes all but one of them per query
 // with a bounding box test. See completeness.cc for why that cannot change a
 // reported distance.
-enum class NnIndexKind { kFlann, kPartitioned };
+//
+// kBoth is a verification mode rather than a third index: it builds both
+// shapes, runs every scan point through both, and reports on stderr how many of
+// them came out of the two with a different float. It exists so that the claim
+// above can be checked on a host, or on a scene, where it has not been checked
+// before -- in one run, rather than argued about.
+enum class NnIndexKind { kFlann, kPartitioned, kBoth };
 
 // Computes the completeness of the reconstruction with respect to the given
 // scans.
@@ -59,7 +65,11 @@ void ComputeCompleteness(
     std::vector<float>* results,
     // Indexed by: [tolerance_index][scan_point_index].
     std::vector<std::vector<bool>>* point_is_complete,
-    NnIndexKind nn_index_kind);
+    NnIndexKind nn_index_kind,
+    // Number of sub-indices to split the reconstruction into, or 0 to use one
+    // per thread. Only a test or a campaign that wants a fixed index shape
+    // regardless of the thread count passes anything else.
+    int nn_index_partitions);
 
 void WriteCompletenessVisualization(
     const std::string& base_path,

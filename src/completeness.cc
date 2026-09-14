@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -313,7 +314,9 @@ void SplitPartitions(PartitionPoint* points, size_t begin, size_t end,
 //    coincident points, collinear and planar partitions, denormal and overflow
 //    scale coordinates, an exact-tolerance lattice, and coordinates 1e5 m from
 //    the origin.
-//  * --nn_index flann is the way out if one ever fires.
+//  * --nn_index both runs both shapes over the same scan and reports any
+//    disagreement, so a new host or an unfamiliar scene is one run away from an
+//    answer; --nn_index flann is the way out if one ever fires.
 // Closing it by proof would mean vendoring FLANN, which would recompile
 // L2_Simple with this project's flags and trade a bound that has never been
 // observed to move for an FMA contraction risk that certainly would.
@@ -586,6 +589,51 @@ double MeasureSubtreeSearchesPerQuery(const ReconstructionNearestIndex& index,
          static_cast<double>(sample_count);
 }
 
+// Number of scan points for which the two index shapes return a different
+// float. The comparison is over the raw bit pattern, so two infinities count as
+// equal and so would two identical NaNs; the point is to detect a value that
+// moved, not to compare them as numbers.
+//
+// This is what --nn_index both exists for. The partitioned index is exact by
+// the argument on ReconstructionNearestIndex except for one leg -- FLANN's own
+// float prune bound, which no argument from outside the library can close -- so
+// a scene or a host where that leg has never been exercised can be checked
+// here directly instead of trusted.
+size_t CountIndexDisagreements(const ReconstructionNearestIndex& index,
+                               const ReconstructionNearestIndex& reference,
+                               const PointCloud& scan,
+                               long long int* first_disagreement) {
+  const long long int scan_size = static_cast<long long int>(scan.size());
+  long long int disagreements = 0;
+  long long int first = scan_size;
+#pragma omp parallel
+  {
+    pcl::Indices knn_indices(1);
+    std::vector<float> knn_squared_dists(1);
+#pragma omp for schedule(dynamic, 4096) reduction(+ : disagreements) \
+    reduction(min : first)
+    for (long long int i = 0; i < scan_size; ++i) {
+      const pcl::PointXYZ& point = scan.at(static_cast<size_t>(i));
+      const float value =
+          index.NearestSquaredDistance(point, &knn_indices, &knn_squared_dists);
+      const float expected = reference.NearestSquaredDistance(
+          point, &knn_indices, &knn_squared_dists);
+      uint32_t value_bits;
+      uint32_t expected_bits;
+      std::memcpy(&value_bits, &value, sizeof(value_bits));
+      std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+      if (value_bits != expected_bits) {
+        ++disagreements;
+        if (i < first) {
+          first = i;
+        }
+      }
+    }
+  }
+  *first_disagreement = first;
+  return static_cast<size_t>(disagreements);
+}
+
 }  // namespace
 
 void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
@@ -598,7 +646,7 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
                          std::vector<float>* results,
                          // Indexed by: [tolerance_index][scan_point_index].
                          std::vector<std::vector<bool>>* point_is_complete,
-                         NnIndexKind nn_index_kind) {
+                         NnIndexKind nn_index_kind, int nn_index_partitions) {
   bool output_point_results = point_is_complete != nullptr;
   size_t tolerances_count = sorted_tolerances.size();
   float maximum_tolerance = sorted_tolerances.back();
@@ -642,10 +690,14 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // instead, which is the original code path; both answer every query with the
   // same float (see ReconstructionNearestIndex).
   int requested_partitions = 1;
-  if (nn_index_kind == NnIndexKind::kPartitioned) {
+  if (nn_index_kind != NnIndexKind::kFlann) {
+    if (nn_index_partitions > 0) {
+      requested_partitions = nn_index_partitions;
+    } else {
 #ifdef _OPENMP
-    requested_partitions = omp_get_max_threads();
+      requested_partitions = omp_get_max_threads();
 #endif
+    }
   }
   ReconstructionNearestIndex reconstruction_nn_index;
   reconstruction_nn_index.Build(reconstruction, requested_partitions);
@@ -665,12 +717,48 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
                  "searches per query over a %zu point probe\n",
                  reconstruction_nn_index.partition_count(), searches_per_query,
                  probe_sample_count);
-    if (searches_per_query > kMaxSubtreeSearchesPerQuery) {
+    // Not under --nn_index both: that mode is asked for in order to compare the
+    // two shapes, so it must keep the shape it was asked to compare.
+    if (nn_index_kind == NnIndexKind::kPartitioned &&
+        searches_per_query > kMaxSubtreeSearchesPerQuery) {
       std::fprintf(stderr,
                    "nn_index: box pruning has collapsed on this scene (above "
                    "%.2f); rebuilding as a single index\n",
                    kMaxSubtreeSearchesPerQuery);
       reconstruction_nn_index.BuildSingleIndex(reconstruction);
+    }
+  }
+
+  // --nn_index both: check the two shapes against each other over every scan
+  // point before the real pass, and say so on stderr. This is a validation
+  // mode; it pays for the serial build it exists to avoid, plus a second query
+  // pass, and nothing in it touches the values the real pass below computes.
+  if (nn_index_kind == NnIndexKind::kBoth) {
+    if (reconstruction_nn_index.partition_count() == 1) {
+      // Say so rather than report a vacuous zero: comparing the single index
+      // against itself proves nothing.
+      std::fprintf(stderr,
+                   "nn_index: nothing to compare, the reconstruction was not "
+                   "partitioned; force it with --nn_index_partitions\n");
+    } else {
+      ReconstructionNearestIndex reference_nn_index;
+      reference_nn_index.BuildSingleIndex(reconstruction);
+      long long int first_disagreement = 0;
+      const size_t disagreements =
+          CountIndexDisagreements(reconstruction_nn_index, reference_nn_index,
+                                  *scan, &first_disagreement);
+      if (disagreements == 0) {
+        std::fprintf(stderr,
+                     "nn_index: %zu of %zu scan points disagree between the "
+                     "partitioned and the single index\n",
+                     disagreements, scan->size());
+      } else {
+        std::fprintf(stderr,
+                     "nn_index: MISMATCH -- %zu of %zu scan points disagree "
+                     "between the partitioned and the single index, first at "
+                     "scan point %lld. Use --nn_index flann on this host.\n",
+                     disagreements, scan->size(), first_disagreement);
+      }
     }
   }
 
