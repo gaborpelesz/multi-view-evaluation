@@ -29,7 +29,9 @@
 #include <Eigen/Core>
 #include <boost/filesystem.hpp>
 #include <pcl/console/parse.h>
+#ifdef MVE_PCL_IO_FALLBACK
 #include <pcl/io/ply_io.h>
+#endif
 
 #include "accuracy.h"
 #include "completeness.h"
@@ -43,11 +45,48 @@ const float kDegToRadFactor = M_PI / 180.0;
 // 0: Success.
 // 1: System failure (e.g., due to wrong parameters given).
 // 2: Reconstruction file input failure (PLY file cannot be found or read).
+// 3: A PLY input file is in a variant this build cannot read (see
+//    MVE_PCL_IO_FALLBACK in CMakeLists.txt). The file itself is fine; the
+//    build simply does not carry PCL's general PLY reader.
 enum class ReturnCodes {
   kSuccess = 0,
   kSystemFailure = 1,
-  kReconstructionFileInputFailure = 2
+  kReconstructionFileInputFailure = 2,
+  kUnsupportedPlyVariant = 3
 };
+
+// Loads one PLY point cloud through fast_ply, falling back to PCL's general
+// reader where the build provides it. Sets `*unsupported_variant` when the file
+// was readable but is not the layout fast_ply handles and there is no fallback
+// linked in -- that is the one failure a different build configuration would
+// have survived, so it gets its own return code rather than being reported as
+// an unreadable file.
+bool LoadPointCloudFile(const std::string& path, PointCloud* cloud,
+                        bool* unsupported_variant) {
+  *unsupported_variant = false;
+  fast_ply::LoadFailure failure = fast_ply::LoadFailure::kNone;
+  if (fast_ply::LoadBinaryXyzPly(path, cloud, &failure)) {
+    return true;
+  }
+#ifdef MVE_PCL_IO_FALLBACK
+  // PCL's general reader stays the reference implementation for every PLY that
+  // is not the one layout the fast path handles. It will also emit the usual
+  // PCL error messages if the file is genuinely unreadable.
+  return pcl::io::loadPLYFile(path, *cloud) >= 0;
+#else
+  *unsupported_variant = (failure == fast_ply::LoadFailure::kNotFastPathShape);
+  return false;
+#endif
+}
+
+// Printed next to the "cannot read" message when the only thing standing
+// between this build and the file is the reader that was configured out.
+const char kUnsupportedPlyVariantHint[] =
+    "The file is not a plain binary_little_endian PLY with a single vertex "
+    "element carrying float x, y, z, and this build does not link PCL's "
+    "general PLY reader: it was configured with MVE_PCL_IO_FALLBACK=OFF so "
+    "that libpcl_io and the 47 VTK libraries behind it are not loaded at "
+    "startup. Reconfigure with -DMVE_PCL_IO_FALLBACK=ON to read this file.";
 
 int main(int argc, char** argv) {
   pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
@@ -137,10 +176,15 @@ int main(int argc, char** argv) {
             << std::endl;
   PointCloudPtr reconstruction(new PointCloud());
   // The fast path handles plain binary_little_endian float x/y/z files and
-  // produces a bit-identical cloud; everything else falls back to PCL.
-  if (!fast_ply::LoadBinaryXyzPly(reconstruction_ply_path, reconstruction.get()) &&
-      pcl::io::loadPLYFile(reconstruction_ply_path, *reconstruction) < 0) {
+  // produces a bit-identical cloud; everything else needs PCL's reader.
+  bool unsupported_variant = false;
+  if (!LoadPointCloudFile(reconstruction_ply_path, reconstruction.get(),
+                          &unsupported_variant)) {
     std::cerr << "Cannot read reconstruction file." << std::endl;
+    if (unsupported_variant) {
+      std::cerr << kUnsupportedPlyVariantHint << std::endl;
+      return static_cast<int>(ReturnCodes::kUnsupportedPlyVariant);
+    }
     return static_cast<int>(ReturnCodes::kReconstructionFileInputFailure);
   }
 
@@ -157,9 +201,13 @@ int main(int argc, char** argv) {
 
     std::cout << "Loading scan: " << file_path << std::endl;
     PointCloudPtr point_cloud(new PointCloud());
-    if (!fast_ply::LoadBinaryXyzPly(file_path, point_cloud.get()) &&
-        pcl::io::loadPLYFile(file_path, *point_cloud) < 0) {
+    if (!LoadPointCloudFile(file_path, point_cloud.get(),
+                            &unsupported_variant)) {
       std::cerr << "Cannot read scan file." << std::endl;
+      if (unsupported_variant) {
+        std::cerr << kUnsupportedPlyVariantHint << std::endl;
+        return static_cast<int>(ReturnCodes::kUnsupportedPlyVariant);
+      }
       return static_cast<int>(ReturnCodes::kSystemFailure);
     }
 

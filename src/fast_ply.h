@@ -47,13 +47,32 @@
 // reader, which stays the reference implementation for all other inputs.
 namespace fast_ply {
 
+// Why LoadBinaryXyzPly() declined a file. The distinction matters because only
+// kNotFastPathShape describes a file that PCL's general reader could plausibly
+// have read, and therefore only that value should send a caller looking for the
+// fallback (or, in a build without one, produce a typed failure).
+enum class LoadFailure {
+  // The file was loaded; nothing was declined.
+  kNone,
+  // The file could not be opened, or its size could not be determined. PCL's
+  // reader would not have got any further.
+  kCannotOpen,
+  // The file opened, but it is not a plain binary_little_endian float x/y/z PLY
+  // with a single vertex element -- or its data block does not have exactly the
+  // length the header implies. PCL's general reader may well handle it.
+  kNotFastPathShape,
+};
+
 // Loads `path` into `cloud` on the fast path. Returns true only if the file
 // matched the supported layout and was read completely; in that case `cloud`
 // holds exactly what pcl::io::loadPLYFile() would have produced. Returns false
 // without leaving usable data in `cloud` otherwise; the caller must then fall
 // back to pcl::io::loadPLYFile() (which will also emit the usual PCL error
 // messages if the file is genuinely unreadable).
-bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud);
+// When `failure` is not null it receives the reason the file was declined, or
+// LoadFailure::kNone on success.
+bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud,
+                      LoadFailure* failure = nullptr);
 
 // Writes `cloud` to `path` as a binary_little_endian PLY, producing byte for
 // byte the same file that pcl::io::savePLYFileBinary() produces for a
