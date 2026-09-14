@@ -41,15 +41,65 @@
 namespace fast_ply {
 namespace {
 
-// Bytes per vertex on disk for the supported layout (float x, y, z).
-constexpr std::uint64_t kDiskPointSize = 3 * sizeof(float);
-// Number of vertices staged per read() call. 8192 vertices are 96 KiB, which
-// stays resident in cache between the read and the stride expansion.
+// Bytes per vertex on disk for the plain layout (float x, y, z), which is the
+// one the evaluation datasets use and the only one with a dedicated fast loop.
+constexpr std::uint64_t kPlainPointSize = 3 * sizeof(float);
+// Number of vertices staged per read() call on the plain path. 8192 vertices
+// are 96 KiB, which stays resident in cache between the read and the stride
+// expansion.
 constexpr std::size_t kChunkPoints = 8192;
+// Staging budget for the general strided path, in bytes. Records there can be
+// arbitrarily wide, so the chunk is sized in bytes rather than in vertices.
+constexpr std::size_t kGeneralChunkBytes = 256 * 1024;
 // A PLY header longer than this is not worth special-casing; fall back.
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
+// A vertex record wider than this is not a point cloud; decline rather than
+// stage megabytes per vertex.
+constexpr std::uint32_t kMaxVertexStride = 4096;
 // IEEE-754 binary32 exponent field; all ones means infinity or NaN.
 constexpr std::uint32_t kFloatExponentMask = 0x7f800000u;
+// IEEE-754 binary64 exponent field, in the high half of the word.
+constexpr std::uint64_t kDoubleExponentMask = 0x7ff0000000000000ull;
+// Marker for "the file does not carry this coordinate at all".
+constexpr std::uint32_t kAbsentOffset = 0xffffffffu;
+
+const char* const kAxisNames[3] = {"x", "y", "z"};
+
+// How this reader treats one fixed-size vertex property. Only the width matters
+// for the stride; the float kinds matter additionally because PCL's PLY reader
+// clears is_dense as soon as ANY floating-point vertex property -- not just a
+// coordinate -- holds a non-finite value. That was verified against PCL 1.15:
+// a file with finite x/y/z and a NaN in `nx`, and one with a NaN in a `double`
+// property, both load with is_dense == false, while files whose only odd values
+// are integral (0xffffffff in a uint, a negative int) load dense.
+enum class PropertyKind : std::uint8_t { kOther, kFloat32, kFloat64 };
+
+struct FloatProperty {
+  std::uint32_t offset;
+  PropertyKind kind;
+};
+
+// Everything the loader needs to know about the vertex element.
+struct VertexLayout {
+  std::uint64_t count = 0;
+  std::uint32_t stride = 0;
+  // Byte offset of x, y and z inside one record, or kAbsentOffset when the file
+  // does not declare that property. PCL leaves a field it did not find at the
+  // value pcl::PointXYZ's default constructor wrote, which is 0; copying
+  // nothing reproduces that.
+  std::uint32_t xyz_offset[3] = {kAbsentOffset, kAbsentOffset, kAbsentOffset};
+  // Every floating-point property of the record, coordinates included, in
+  // declaration order. Only used to derive is_dense.
+  std::vector<FloatProperty> float_properties;
+
+  // True for the layout the evaluation datasets use: exactly float x, y, z in
+  // that order and nothing else, so the on-disk bytes can be copied verbatim.
+  bool IsPlainXyz() const {
+    return stride == kPlainPointSize && xyz_offset[0] == 0 &&
+           xyz_offset[1] == 4 && xyz_offset[2] == 8 &&
+           float_properties.size() == 3;
+  }
+};
 
 bool HostIsLittleEndian() {
   const std::uint32_t value = 1;
@@ -102,21 +152,57 @@ bool IsFloat32Type(const std::string& type) {
   return type == "float" || type == "float32";
 }
 
+// Width in bytes of a fixed-size PLY scalar type, and how it is treated here.
+// Returns 0 for a type this reader does not know, which is a reason to decline.
+std::uint32_t ScalarType(const std::string& type, PropertyKind* kind) {
+  *kind = PropertyKind::kOther;
+  if (type == "float" || type == "float32") {
+    *kind = PropertyKind::kFloat32;
+    return 4;
+  }
+  if (type == "double" || type == "float64") {
+    *kind = PropertyKind::kFloat64;
+    return 8;
+  }
+  if (type == "char" || type == "int8" || type == "uchar" || type == "uint8") {
+    return 1;
+  }
+  if (type == "short" || type == "int16" || type == "ushort" ||
+      type == "uint16") {
+    return 2;
+  }
+  if (type == "int" || type == "int32" || type == "uint" || type == "uint32") {
+    return 4;
+  }
+  return 0;
+}
+
 // Parses the header of an already-opened PLY file. On success, reports the
-// vertex count and the byte offset at which the vertex data starts. Returns
-// false for every header that is not provably "binary_little_endian 1.0 with a
-// single vertex element carrying exactly float x, float y, float z".
+// vertex element's layout and the byte offset at which its data starts.
+//
+// What is accepted is every binary_little_endian file whose vertex records have
+// a fixed width and whose x, y and z (where present) are float32 -- which
+// covers the shapes real reconstruction and scan files carry: x,y,z with
+// normals, with colour, with per-point scalars, in any property order. What is
+// declined is every file whose contents this reader cannot reproduce exactly:
+// ASCII or big-endian encodings, list properties inside the vertex element,
+// coordinates stored as double or as an integer type (PCL converts those, and
+// this reader will not guess at the rounding), an `obj_info` line (PCL maps it
+// onto the cloud dimensions and the sensor origin), a `camera` element carrying
+// data (PCL reads the sensor pose out of it -- verified), a `range_grid`
+// element carrying data, and any other element carrying data before the vertex
+// block or under a name PCL's point-cloud read path is not known to ignore.
 bool ParseSupportedHeader(const std::vector<char>& buffer,
-                          std::uint64_t* vertex_count,
+                          VertexLayout* layout,
                           std::uint64_t* data_offset) {
   bool seen_magic = false;
   bool seen_format = false;
   bool seen_vertex_element = false;
   bool seen_end_header = false;
-  int property_count = 0;
-  std::uint64_t count = 0;
-
-  static const char* const kExpectedProperties[3] = {"x", "y", "z"};
+  // Name of the element whose property lines are currently being read, empty
+  // before the first `element` line.
+  std::string current_element;
+  VertexLayout vertex;
 
   std::size_t pos = 0;
   while (pos < buffer.size()) {
@@ -174,24 +260,77 @@ bool ParseSupportedHeader(const std::vector<char>& buffer,
     }
 
     if (keyword == "element") {
-      // Exactly one element is supported, and it must be the vertex element.
-      // Anything else (face, camera, range_grid, ...) changes what PCL's
-      // reader produces, so it must go through PCL.
-      if (seen_vertex_element || tokens.size() != 3 || tokens[1] != "vertex" ||
-          !ParseCount(tokens[2], &count)) {
+      std::uint64_t count = 0;
+      if (tokens.size() != 3 || !ParseCount(tokens[2], &count)) {
         return false;
       }
-      seen_vertex_element = true;
+      current_element = tokens[1];
+      if (current_element == "vertex") {
+        // Two vertex elements would make the cloud PCL builds depend on how it
+        // merges them; that is not worth reproducing.
+        if (seen_vertex_element) {
+          return false;
+        }
+        seen_vertex_element = true;
+        vertex.count = count;
+      } else if (count > 0) {
+        // An element carrying data BEFORE the vertex block moves the block, and
+        // this reader does not walk variable-length element data to find it.
+        // After the block, only `face` is known -- and was verified on PCL 1.15
+        // -- to leave the loaded point cloud untouched; `camera` demonstrably
+        // does not (it sets the sensor pose), and `range_grid` has a documented
+        // role in PCL's reader, so both are declined.
+        if (!seen_vertex_element || current_element != "face") {
+          return false;
+        }
+      }
       continue;
     }
 
     if (keyword == "property") {
-      if (!seen_vertex_element || property_count >= 3 || tokens.size() != 3 ||
-          !IsFloat32Type(tokens[1]) ||
-          tokens[2] != kExpectedProperties[property_count]) {
+      if (current_element.empty()) {
         return false;
       }
-      ++property_count;
+      const bool is_list = tokens.size() > 1 && tokens[1] == "list";
+      if (current_element != "vertex") {
+        // The bytes of this element are never read, so only the syntax has to
+        // be plausible. Anything malformed means the header is not understood.
+        if (is_list ? (tokens.size() != 5) : (tokens.size() != 3)) {
+          return false;
+        }
+        continue;
+      }
+      // A list property inside the vertex element makes the record width
+      // data-dependent, so there is no stride to seek with.
+      if (is_list || tokens.size() != 3) {
+        return false;
+      }
+      PropertyKind kind = PropertyKind::kOther;
+      const std::uint32_t size = ScalarType(tokens[1], &kind);
+      if (size == 0) {
+        return false;
+      }
+      const std::string& name = tokens[2];
+      for (int axis = 0; axis < 3; ++axis) {
+        if (name != kAxisNames[axis]) {
+          continue;
+        }
+        // PCL converts a coordinate stored as double or as an integer into the
+        // float field of pcl::PointXYZ. This reader copies words verbatim, so
+        // rather than reimplement that conversion it declines the file.
+        if (!IsFloat32Type(tokens[1]) ||
+            vertex.xyz_offset[axis] != kAbsentOffset) {
+          return false;
+        }
+        vertex.xyz_offset[axis] = vertex.stride;
+      }
+      if (kind != PropertyKind::kOther) {
+        vertex.float_properties.push_back(FloatProperty{vertex.stride, kind});
+      }
+      vertex.stride += size;
+      if (vertex.stride > kMaxVertexStride) {
+        return false;
+      }
       continue;
     }
 
@@ -208,18 +347,35 @@ bool ParseSupportedHeader(const std::vector<char>& buffer,
   }
 
   if (!seen_end_header || !seen_format || !seen_vertex_element ||
-      property_count != 3) {
+      vertex.stride == 0) {
     return false;
   }
   // pcl::PCLPointCloud2::width is 32 bit, and the byte count below must not
   // overflow. No real file comes close to either bound; fall back if one does.
-  if (count > UINT32_MAX || count > UINT64_MAX / kDiskPointSize) {
+  if (vertex.count > UINT32_MAX ||
+      vertex.count > UINT64_MAX / vertex.stride) {
     return false;
   }
 
-  *vertex_count = count;
+  *layout = vertex;
   *data_offset = pos;
   return true;
+}
+
+// True when the float32 at `bytes` is infinity or NaN. The test is done on the
+// raw bit pattern -- the exponent field being all ones is exactly what
+// std::isfinite() reports -- so no value is ever loaded into a float register,
+// which keeps signalling NaNs out of the FPU.
+inline bool IsNonFiniteFloat32(const char* bytes) {
+  std::uint32_t bits;
+  std::memcpy(&bits, bytes, sizeof(bits));
+  return (bits & kFloatExponentMask) == kFloatExponentMask;
+}
+
+inline bool IsNonFiniteFloat64(const char* bytes) {
+  std::uint64_t bits;
+  std::memcpy(&bits, bytes, sizeof(bits));
+  return (bits & kDoubleExponentMask) == kDoubleExponentMask;
 }
 
 }  // namespace
@@ -231,8 +387,7 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud,
   if (failure == nullptr) {
     failure = &ignored;
   }
-  // Every `return false` below is a shape or integrity rejection except the
-  // fopen() one, which overwrites this.
+  // Every `return false` below is a shape rejection unless it overwrites this.
   *failure = LoadFailure::kNotFastPathShape;
 
   if (!HostIsLittleEndian()) {
@@ -241,7 +396,7 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud,
 
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
-    *failure = LoadFailure::kCannotOpen;
+    *failure = LoadFailure::kUnreadable;
     return false;
   }
 
@@ -250,82 +405,133 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud,
       std::fread(header.data(), 1, header.size(), file);
   header.resize(header_bytes);
 
-  std::uint64_t vertex_count = 0;
+  VertexLayout layout;
   std::uint64_t data_offset = 0;
-  if (!ParseSupportedHeader(header, &vertex_count, &data_offset)) {
+  if (!ParseSupportedHeader(header, &layout, &data_offset)) {
     std::fclose(file);
     return false;
   }
 
-  // The data block must be exactly as long as the header claims. A short file
-  // is corrupt; a long one holds something this reader did not account for.
-  // Checking this before allocating also keeps a corrupt vertex count from
-  // turning into a huge allocation.
+  // The vertex block must be present in full. A file that stops inside it is
+  // corrupt, and PCL's reader fails on it too (verified), so this is reported
+  // as an unreadable file rather than as an unsupported variant. Bytes AFTER
+  // the block are ignored, which is also what PCL does: a file with trailing
+  // junk, and a file with a populated `face` element, both load there as the
+  // vertices alone. Checking the length before allocating additionally keeps a
+  // corrupt vertex count from turning into a huge allocation.
   boost::system::error_code error;
   const boost::uintmax_t file_size = boost::filesystem::file_size(path, error);
   if (error) {
     std::fclose(file);
-    *failure = LoadFailure::kCannotOpen;
+    *failure = LoadFailure::kUnreadable;
     return false;
   }
-  if (static_cast<std::uint64_t>(file_size) !=
-      data_offset + vertex_count * kDiskPointSize) {
+  if (static_cast<std::uint64_t>(file_size) <
+      data_offset + layout.count * layout.stride) {
     std::fclose(file);
+    *failure = LoadFailure::kUnreadable;
     return false;
   }
   // The header is bounded by kMaxHeaderBytes, so this offset always fits.
   if (std::fseek(file, static_cast<long>(data_offset), SEEK_SET) != 0) {
     std::fclose(file);
+    *failure = LoadFailure::kUnreadable;
     return false;
   }
 
   // Match what pcl::io::loadPLYFile() leaves behind for a file without a
   // "camera" element: an unorganized cloud with an identity sensor pose.
-  // resize() default-constructs every point, which is what sets the fourth
-  // (padding) float of pcl::PointXYZ to 1.0f, exactly as PCL's conversion from
-  // pcl::PCLPointCloud2 does; only x, y and z are written below.
+  // resize() default-constructs every point, which is what sets x, y and z to
+  // 0 and the fourth (padding) float of pcl::PointXYZ to 1.0f, exactly as PCL's
+  // conversion from pcl::PCLPointCloud2 does. Only the coordinates the file
+  // actually declares are written below, so a file that omits one of them keeps
+  // the 0 there -- which is what PCL produces for it (verified).
   cloud->clear();
   cloud->sensor_origin_ = Eigen::Vector4f::Zero();
   cloud->sensor_orientation_ = Eigen::Quaternionf::Identity();
-  cloud->resize(static_cast<std::size_t>(vertex_count));
-  cloud->width = static_cast<std::uint32_t>(vertex_count);
+  cloud->resize(static_cast<std::size_t>(layout.count));
+  cloud->width = static_cast<std::uint32_t>(layout.count);
   cloud->height = 1;
 
-  std::vector<float> staging(3 * kChunkPoints);
-  // PCL's PLY reader clears is_dense as soon as one vertex coordinate is not
-  // finite, and is_dense selects different code paths further downstream (the
-  // non-dense branch of pcl::transformPointCloud, the invalid-point filtering
-  // in the FLANN k-d tree), so the same flag has to be derived here. The test
-  // is done on the raw bit pattern: a float32 is non-finite exactly when its
-  // exponent field is all ones, which is what std::isfinite() reports.
+  // PCL's PLY reader clears is_dense as soon as one floating-point vertex
+  // property is not finite, and is_dense selects different code paths further
+  // downstream (the non-dense branch of pcl::transformPointCloud, the
+  // invalid-point filtering in the FLANN k-d tree), so the same flag has to be
+  // derived here.
   std::uint32_t any_non_finite = 0;
   pcl::PointXYZ* dest = cloud->points.data();
-  std::uint64_t remaining = vertex_count;
-  while (remaining > 0) {
-    const std::size_t chunk = static_cast<std::size_t>(
-        remaining < kChunkPoints ? remaining : kChunkPoints);
-    if (std::fread(staging.data(), static_cast<std::size_t>(kDiskPointSize),
-                   chunk, file) != chunk) {
-      std::fclose(file);
-      cloud->clear();
-      return false;
-    }
+  std::uint64_t remaining = layout.count;
 
-    const std::size_t word_count = 3 * chunk;
-    for (std::size_t i = 0; i < word_count; ++i) {
-      std::uint32_t bits;
-      std::memcpy(&bits, staging.data() + i, sizeof(bits));
-      any_non_finite |= static_cast<std::uint32_t>(
-          (bits & kFloatExponentMask) == kFloatExponentMask);
-    }
+  if (layout.IsPlainXyz()) {
+    // The layout of every file in the evaluation datasets: the on-disk bytes
+    // are already three IEEE-754 float32 in the order of pcl::PointXYZ's first
+    // three members, so a whole chunk is copied without touching a single
+    // coordinate individually.
+    std::vector<float> staging(3 * kChunkPoints);
+    while (remaining > 0) {
+      const std::size_t chunk = static_cast<std::size_t>(
+          remaining < kChunkPoints ? remaining : kChunkPoints);
+      if (std::fread(staging.data(), static_cast<std::size_t>(kPlainPointSize),
+                     chunk, file) != chunk) {
+        std::fclose(file);
+        cloud->clear();
+        *failure = LoadFailure::kUnreadable;
+        return false;
+      }
 
-    const float* source = staging.data();
-    for (std::size_t i = 0; i < chunk; ++i, source += 3, ++dest) {
-      // Verbatim copy of the three float32 values; the padding float keeps the
-      // 1.0f that default construction wrote.
-      std::memcpy(dest->data, source, kDiskPointSize);
+      const std::size_t word_count = 3 * chunk;
+      for (std::size_t i = 0; i < word_count; ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, staging.data() + i, sizeof(bits));
+        any_non_finite |= static_cast<std::uint32_t>(
+            (bits & kFloatExponentMask) == kFloatExponentMask);
+      }
+
+      const float* source = staging.data();
+      for (std::size_t i = 0; i < chunk; ++i, source += 3, ++dest) {
+        // Verbatim copy of the three float32 values; the padding float keeps
+        // the 1.0f that default construction wrote.
+        std::memcpy(dest->data, source, kPlainPointSize);
+      }
+      remaining -= chunk;
     }
-    remaining -= chunk;
+  } else {
+    // General strided path: the record carries normals, colour or per-point
+    // scalars around the coordinates. The coordinate words are still copied
+    // verbatim; only their offsets inside the record differ.
+    const std::size_t records_per_chunk =
+        kGeneralChunkBytes / layout.stride > 0
+            ? kGeneralChunkBytes / layout.stride
+            : static_cast<std::size_t>(1);
+    std::vector<char> staging(records_per_chunk * layout.stride);
+    while (remaining > 0) {
+      const std::size_t chunk = static_cast<std::size_t>(
+          remaining < records_per_chunk ? remaining : records_per_chunk);
+      if (std::fread(staging.data(), layout.stride, chunk, file) != chunk) {
+        std::fclose(file);
+        cloud->clear();
+        *failure = LoadFailure::kUnreadable;
+        return false;
+      }
+
+      const char* record = staging.data();
+      for (std::size_t i = 0; i < chunk; ++i, record += layout.stride, ++dest) {
+        for (int axis = 0; axis < 3; ++axis) {
+          if (layout.xyz_offset[axis] != kAbsentOffset) {
+            std::memcpy(&dest->data[axis], record + layout.xyz_offset[axis],
+                        sizeof(float));
+          }
+        }
+        for (const FloatProperty& property : layout.float_properties) {
+          const bool non_finite =
+              property.kind == PropertyKind::kFloat32
+                  ? IsNonFiniteFloat32(record + property.offset)
+                  : IsNonFiniteFloat64(record + property.offset);
+          any_non_finite |= static_cast<std::uint32_t>(non_finite);
+        }
+      }
+      remaining -= chunk;
+    }
   }
   cloud->is_dense = (any_non_finite == 0);
 
