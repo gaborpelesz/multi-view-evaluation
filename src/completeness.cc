@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -41,6 +42,8 @@
 #include <pcl/common/transforms.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
+
+#include "band0_filter.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -774,13 +777,6 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     }
   }
 
-  // Differently shifted voxel grids.
-  // Indexed by: [map_index], then by the dense cell id that the grid assigns to
-  // CalcCellCoordinates(...).
-  CompletenessCellGrid cell_maps[kGridCount];
-
-  const int kNN = 1;
-
   // Squared search radius, reproducing bit-for-bit the threshold that
   // pcl::KdTreeFLANN::radiusSearch() used to hand to FLANN: it takes the radius
   // as a double and passes static_cast<float>(radius * radius). Promoting the
@@ -790,6 +786,33 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   const float maximum_tolerance_squared =
       static_cast<float>(static_cast<double>(maximum_tolerance) *
                          static_cast<double>(maximum_tolerance));
+
+  // Pre-filter for the nearest neighbour query below. A scan point with any
+  // reconstruction point within the finest tolerance is complete for every
+  // tolerance, so its band is 0 and the exact nearest neighbour distance is not
+  // needed; the filter establishes that for the majority of the scan points at
+  // a small fraction of the cost of a kd-tree descent, and declines for the
+  // rest, which then take the original path unchanged.
+  //
+  // Two preconditions make reporting band 0 sound, and the filter stays off if
+  // either fails. The band walk ends at 0 iff sorted_tolerances_squared[0] is
+  // not below the reported squared distance, which the filter's acceptance
+  // threshold guarantees, but only if that threshold is above zero at all. And
+  // the outer test is a strict 'knn_squared_dists[0] < maximum_tolerance_
+  // squared', which an all-zero tolerance list would fail even for a point
+  // lying exactly on a reconstruction point.
+  Band0VoxelFilter band0_filter;
+  if (sorted_tolerances.front() > 0.f && maximum_tolerance_squared > 0.f) {
+    band0_filter.Build(*reconstruction, sorted_tolerances.front(),
+                       sorted_tolerances_squared.front());
+  }
+
+  // Differently shifted voxel grids.
+  // Indexed by: [map_index], then by the dense cell id that the grid assigns to
+  // CalcCellCoordinates(...).
+  CompletenessCellGrid cell_maps[kGridCount];
+
+  const int kNN = 1;
 
   const long long int scan_point_size =
       static_cast<long long int>(scan->size());
@@ -919,6 +942,11 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
         static_cast<uint32_t>(tolerances_count));
   }
 
+  // Number of scan points the pre-filter answered on its own, for the
+  // fallback-rate report below. Accumulated per thread in a register and folded
+  // once per thread, so the hot loop pays nothing for it.
+  long long int band0_accepted = 0;
+
   // Pass 2 (parallel): the nearest neighbour search. Every iteration reads the
   // nearest neighbour index and writes only integer tallies of its own cells
   // plus its own entry of the per-point output, so the loop is free of ordering
@@ -930,11 +958,38 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     pcl::PointXYZ search_point;
     pcl::Indices knn_indices(kNN);
     std::vector<float> knn_squared_dists(kNN);
+    long long int thread_band0_accepted = 0;
 
 #pragma omp for schedule(dynamic, 4096)
     for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
          ++scan_point_index) {
       const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
+
+      // The pre-filter answers "there is a reconstruction point within the
+      // finest tolerance", which forces the smallest complete tolerance index
+      // to 0 and makes the kd-tree query unnecessary. It never answers anything
+      // else: when it declines, the original code below runs unchanged, and
+      // when it accepts, no distance is synthesised -- the band is written
+      // directly at its floor. See Band0VoxelFilter for why an acceptance
+      // cannot disagree with what the kd-tree would have reported.
+      if (band0_filter.HasPointWithin(scan_point.x, scan_point.y,
+                                      scan_point.z)) {
+        ++thread_band0_accepted;
+        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+          uint32_t* bin =
+              histogram_ptrs[grid_index] +
+              static_cast<size_t>(
+                  point_cell_ids_ptrs[grid_index][scan_point_index]) *
+                  tolerances_count;
+#pragma omp atomic
+          ++(*bin);
+        }
+
+        if (output_point_results) {
+          smallest_complete_tolerance_indices[scan_point_index] = 0;
+        }
+        continue;
+      }
 
       // Find the closest reconstruction point to this scan point.
       //
@@ -995,6 +1050,26 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
         }
       }
     }
+
+#pragma omp atomic
+    band0_accepted += thread_band0_accepted;
+  }
+
+  // The hit rate is a property of the scene, not of the program: a
+  // reconstruction that covers the ground truth poorly falls back for most of
+  // its scan points and the filter then only costs its build. Reporting it
+  // keeps that visible in a campaign record instead of hidden in a wall clock.
+  if (std::getenv("MVE_BAND0_STATS") != nullptr) {
+    std::fprintf(stderr,
+                 "band0 filter: %s, %lld of %lld scan points answered "
+                 "(%.2f%% fell back to the kd-tree)\n",
+                 band0_filter.enabled() ? "on" : "off", band0_accepted,
+                 scan_point_size,
+                 scan_point_size > 0
+                     ? 100.0 * static_cast<double>(scan_point_size -
+                                                   band0_accepted) /
+                           static_cast<double>(scan_point_size)
+                     : 0.0);
   }
 
   // Output point results, if requested. The points are incomplete for

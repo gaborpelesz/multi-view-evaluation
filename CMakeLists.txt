@@ -124,6 +124,7 @@ include_directories(./src)
 add_executable(ETH3DMultiViewEvaluation
     src/accuracy.cc
     src/accuracy.h
+    src/band0_filter.h
     src/completeness.cc
     src/completeness.h
     src/fast_ply.cc
