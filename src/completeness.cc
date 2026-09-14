@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include <omp.h>
+
 #include "completeness.h"
 
 #include <pcl/common/transforms.h>
@@ -658,6 +660,7 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
                          float voxel_size_inv,
                          // Sorted by increasing tolerance.
                          const std::vector<float>& sorted_tolerances,
+                         bool serial_prepare,
                          // Indexed by: [tolerance_index]. Range: [0, 1].
                          std::vector<float>* results,
                          // Indexed by: [tolerance_index][scan_point_index].
@@ -715,68 +718,9 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
 #endif
     }
   }
+  // Declared here but not built here: the build is one of the two preparation
+  // blocks below, which may run concurrently with the cell assignment.
   ReconstructionNearestIndex reconstruction_nn_index;
-  reconstruction_nn_index.Build(reconstruction, requested_partitions);
-
-  // How well the partition boxes actually prune is a property of the scene, not
-  // of the code, and the whole reason the partitioned build is worth doing is
-  // that it stays near one sub-tree search per query. Measure it on a sample of
-  // the queries that are about to be run, report it -- a campaign that regresses
-  // here should say so in its own log rather than be inferred from a wall clock
-  // -- and go back to the single index when it has collapsed.
-  if (reconstruction_nn_index.partition_count() > 1) {
-    size_t probe_sample_count = 0;
-    const double searches_per_query = MeasureSubtreeSearchesPerQuery(
-        reconstruction_nn_index, *scan, &probe_sample_count);
-    std::fprintf(stderr,
-                 "nn_index: partitioned into %d sub-trees, %.4f sub-tree "
-                 "searches per query over a %zu point probe\n",
-                 reconstruction_nn_index.partition_count(), searches_per_query,
-                 probe_sample_count);
-    // Not under --nn_index both: that mode is asked for in order to compare the
-    // two shapes, so it must keep the shape it was asked to compare.
-    if (nn_index_kind == NnIndexKind::kPartitioned &&
-        searches_per_query > kMaxSubtreeSearchesPerQuery) {
-      std::fprintf(stderr,
-                   "nn_index: box pruning has collapsed on this scene (above "
-                   "%.2f); rebuilding as a single index\n",
-                   kMaxSubtreeSearchesPerQuery);
-      reconstruction_nn_index.BuildSingleIndex(reconstruction);
-    }
-  }
-
-  // --nn_index both: check the two shapes against each other over every scan
-  // point before the real pass, and say so on stderr. This is a validation
-  // mode; it pays for the serial build it exists to avoid, plus a second query
-  // pass, and nothing in it touches the values the real pass below computes.
-  if (nn_index_kind == NnIndexKind::kBoth) {
-    if (reconstruction_nn_index.partition_count() == 1) {
-      // Say so rather than report a vacuous zero: comparing the single index
-      // against itself proves nothing.
-      std::fprintf(stderr,
-                   "nn_index: nothing to compare, the reconstruction was not "
-                   "partitioned; force it with --nn_index_partitions\n");
-    } else {
-      ReconstructionNearestIndex reference_nn_index;
-      reference_nn_index.BuildSingleIndex(reconstruction);
-      long long int first_disagreement = 0;
-      const size_t disagreements =
-          CountIndexDisagreements(reconstruction_nn_index, reference_nn_index,
-                                  *scan, &first_disagreement);
-      if (disagreements == 0) {
-        std::fprintf(stderr,
-                     "nn_index: %zu of %zu scan points disagree between the "
-                     "partitioned and the single index\n",
-                     disagreements, scan->size());
-      } else {
-        std::fprintf(stderr,
-                     "nn_index: MISMATCH -- %zu of %zu scan points disagree "
-                     "between the partitioned and the single index, first at "
-                     "scan point %lld. Use --nn_index flann on this host.\n",
-                     disagreements, scan->size(), first_disagreement);
-      }
-    }
-  }
 
   // Squared search radius, reproducing bit-for-bit the threshold that
   // pcl::KdTreeFLANN::radiusSearch() used to hand to FLANN: it takes the radius
@@ -843,92 +787,251 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // address an already-determined id is stored at changes.
   std::vector<uint32_t> point_cell_ids(
       static_cast<size_t>(scan_point_size) * kGridCount);
-  // Size both cell tables and their point count arrays before anything is
-  // inserted. Left to grow from its 1024-slot default, each table doubles its
-  // way up to millions of slots and re-probes every cell it holds at every
-  // doubling, which costs more random probes than answering the lookups does.
-  // The estimate is a sample of the cell space rather than of the points, so it
-  // tracks the number of cells at any density and each table -- and each point
-  // count array -- ends up the size it would have grown to anyway.
-  size_t expected_cells[kGridCount];
-  EstimateDistinctCellCounts(scan->points.data(),
-                             static_cast<size_t>(scan_point_size),
-                             voxel_size_inv, kGridShifts, expected_cells);
-  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    cell_maps[grid_index].Reserve(expected_cells[grid_index]);
-  }
-  // Both grids are walked together, one point at a time. kGridCount is a
-  // compile-time 2, so the grid loop unrolls and the point array is streamed
-  // once instead of once per grid. Every grid keeps its own table, its own id
-  // stream, its own point counts and its own memo below, and never reads
-  // another grid's state, so interleaving the two cannot change either grid's
-  // sequence of first-touched cells -- each still sees the points in strictly
-  // ascending index order.
-  uint32_t* grid_cell_ids[kGridCount];
-  // If a point falls into the same voxel as the previous one, remembering that
-  // cell saves a table lookup; measured on the bench dataset, that is the case
-  // for ~7% of the scan points (they are still in scanline order). The cell a
-  // point lands in is unaffected: the memo only short-circuits a lookup that
-  // would have returned the very same id.
-  VoxelCellKey previous_key[kGridCount];
-  uint32_t previous_id[kGridCount];
-  bool have_previous[kGridCount];
-  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    grid_cell_ids[grid_index] = point_cell_ids.data() +
-                                static_cast<size_t>(grid_index) *
-                                    scan_point_size;
-    previous_key[grid_index] = VoxelCellKey{0, 0, 0};
-    previous_id[grid_index] = 0;
-    have_previous[grid_index] = false;
-  }
-
-  // The lookups themselves are random accesses into a 134 MB table and miss
-  // cache almost every time, while the points are read sequentially, so the key
-  // of a point some distance ahead can be computed for free and its table slot
-  // fetched while the current point is being resolved. 12 points ahead measured
-  // best in the 8-16 range.
-  const long long int kPrefetchDistance = 12;
-
-  for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
-       ++scan_point_index) {
-    if (scan_point_index + kPrefetchDistance < scan_point_size) {
-      const pcl::PointXYZ& ahead_point =
-          scan->at(scan_point_index + kPrefetchDistance);
-      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-        cell_maps[grid_index].Prefetch(CalcCellCoordinates(
-            ahead_point, voxel_size_inv, kGridShifts[grid_index][0],
-            kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
-      }
-    }
-
-    const pcl::PointXYZ& scan_point = scan->at(scan_point_index);
-    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      const VoxelCellKey key = CalcCellCoordinates(
-          scan_point, voxel_size_inv, kGridShifts[grid_index][0],
-          kGridShifts[grid_index][1], kGridShifts[grid_index][2]);
-      uint32_t cell_id;
-      if (have_previous[grid_index] && key == previous_key[grid_index]) {
-        cell_id = previous_id[grid_index];
-      } else {
-        cell_id = cell_maps[grid_index].GetCell(key);
-        previous_key[grid_index] = key;
-        previous_id[grid_index] = cell_id;
-        have_previous[grid_index] = true;
-      }
-      ++cell_maps[grid_index].point_count[cell_id];
-      grid_cell_ids[grid_index][scan_point_index] = cell_id;
-    }
-  }
-
-  // Size the per-cell histograms now that every cell is known, and take raw
-  // pointers to them: the parallel pass below only ever increments existing
-  // entries, so the arrays are never reallocated while it runs.
+  // Raw pointers into the per-cell histograms, taken once pass 1 has seen every
+  // cell. The parallel pass below only ever increments existing entries, so the
+  // arrays are never reallocated while it runs.
   uint32_t* histogram_ptrs[kGridCount];
-  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    CompletenessCellGrid& grid = cell_maps[grid_index];
-    grid.complete_count.assign(grid.cell_count() * tolerances_count, 0);
-    histogram_ptrs[grid_index] = grid.complete_count.data();
+
+  // The two blocks of preparation this function needs before the nearest
+  // neighbour search can start. They are written as lambdas only so that the
+  // concurrent and the strictly serial arrangement below can share one copy of
+  // the code; each is still executed exactly once per call, whole, on a single
+  // thread.
+  //
+  // They touch disjoint state: BuildReconstructionIndex reads only
+  // *reconstruction and writes only reconstruction_nn_index, while AssignCells
+  // reads only *scan and writes only cell_maps, point_cell_ids and
+  // histogram_ptrs. Neither reads anything the other writes, and the first
+  // statement that needs both is the query in pass 2, after they have both
+  // finished. That is what makes running them concurrently safe.
+  //
+  // The capture lists are spelled out instead of being left as [&] so that the
+  // disjointness the concurrency rests on is enforced by the compiler rather
+  // than only asserted in this comment: neither lambda can name anything the
+  // other writes, because it does not capture it.
+  auto BuildReconstructionIndex = [&reconstruction_nn_index, &reconstruction,
+                                   requested_partitions]() {
+    reconstruction_nn_index.Build(reconstruction, requested_partitions);
+  };
+
+  auto AssignCells = [&cell_maps, &point_cell_ids, &histogram_ptrs, &scan,
+                      voxel_size_inv, scan_point_size, tolerances_count]() {
+    // Hoist the loop invariants out of the closure before the hot loop. A
+    // lambda holds its by-reference captures as pointers into the enclosing
+    // frame, and the loop below calls CompletenessCellGrid::GetCell, which the
+    // compiler cannot see through, so without these copies every iteration
+    // reloads the scan cloud, the voxel size and the point count through the
+    // closure and re-reads the output vector's data pointer: several extra
+    // dependent loads per point, over 3.17M points and two grids. None of them
+    // is written anywhere in this lambda, so caching them changes no value and
+    // no ordering -- it only decides where they are held.
+    const PointCloud& scan_points = *scan;
+    const float inv_voxel_size = voxel_size_inv;
+    const long long int num_scan_points = scan_point_size;
+    // point_cell_ids was sized above and is never resized here, so its buffer
+    // cannot move while this loop runs.
+    uint32_t* const point_cell_ids_out = point_cell_ids.data();
+
+    // Size both cell tables and their point count arrays before anything is
+    // inserted. Left to grow from its 1024-slot default, each table doubles its
+    // way up to millions of slots and re-probes every cell it holds at every
+    // doubling, which costs more random probes than answering the lookups does.
+    // The estimate is a sample of the cell space rather than of the points, so
+    // it tracks the number of cells at any density and each table -- and each
+    // point count array -- ends up the size it would have grown to anyway.
+    size_t expected_cells[kGridCount];
+    EstimateDistinctCellCounts(scan_points.points.data(),
+                               static_cast<size_t>(num_scan_points),
+                               inv_voxel_size, kGridShifts, expected_cells);
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      cell_maps[grid_index].Reserve(expected_cells[grid_index]);
+    }
+    // Both grids are walked together, one point at a time. kGridCount is a
+    // compile-time 2, so the grid loop unrolls and the point array is streamed
+    // once instead of once per grid. Every grid keeps its own table, its own id
+    // stream, its own point counts and its own memo below, and never reads
+    // another grid's state, so interleaving the two cannot change either grid's
+    // sequence of first-touched cells -- each still sees the points in strictly
+    // ascending index order.
+    uint32_t* grid_cell_ids[kGridCount];
+    // If a point falls into the same voxel as the previous one, remembering
+    // that cell saves a table lookup; measured on the bench dataset, that is
+    // the case for ~7% of the scan points (they are still in scanline order).
+    // The cell a point lands in is unaffected: the memo only short-circuits a
+    // lookup that would have returned the very same id.
+    VoxelCellKey previous_key[kGridCount];
+    uint32_t previous_id[kGridCount];
+    bool have_previous[kGridCount];
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      grid_cell_ids[grid_index] =
+          point_cell_ids_out +
+          static_cast<size_t>(grid_index) * num_scan_points;
+      previous_key[grid_index] = VoxelCellKey{0, 0, 0};
+      previous_id[grid_index] = 0;
+      have_previous[grid_index] = false;
+    }
+
+    // The lookups themselves are random accesses into a 134 MB table and miss
+    // cache almost every time, while the points are read sequentially, so the
+    // key of a point some distance ahead can be computed for free and its table
+    // slot fetched while the current point is being resolved. 12 points ahead
+    // measured best in the 8-16 range.
+    const long long int kPrefetchDistance = 12;
+
+    for (long long int scan_point_index = 0;
+         scan_point_index < num_scan_points; ++scan_point_index) {
+      if (scan_point_index + kPrefetchDistance < num_scan_points) {
+        const pcl::PointXYZ& ahead_point =
+            scan_points.at(scan_point_index + kPrefetchDistance);
+        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+          cell_maps[grid_index].Prefetch(CalcCellCoordinates(
+              ahead_point, inv_voxel_size, kGridShifts[grid_index][0],
+              kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
+        }
+      }
+
+      const pcl::PointXYZ& scan_point = scan_points.at(scan_point_index);
+      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+        const VoxelCellKey key = CalcCellCoordinates(
+            scan_point, inv_voxel_size, kGridShifts[grid_index][0],
+            kGridShifts[grid_index][1], kGridShifts[grid_index][2]);
+        uint32_t cell_id;
+        if (have_previous[grid_index] && key == previous_key[grid_index]) {
+          cell_id = previous_id[grid_index];
+        } else {
+          cell_id = cell_maps[grid_index].GetCell(key);
+          previous_key[grid_index] = key;
+          previous_id[grid_index] = cell_id;
+          have_previous[grid_index] = true;
+        }
+        ++cell_maps[grid_index].point_count[cell_id];
+        grid_cell_ids[grid_index][scan_point_index] = cell_id;
+      }
+    }
+
+    // Size the per-cell histograms now that every cell is known.
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      CompletenessCellGrid& grid = cell_maps[grid_index];
+      grid.complete_count.assign(grid.cell_count() * tolerances_count, 0);
+      histogram_ptrs[grid_index] = grid.complete_count.data();
+    }
+  };
+
+  // Run the two preparation blocks concurrently when the runtime has more than
+  // one thread to offer and the index build is itself a single serial block.
+  // Both were strictly serial internally and used to run back to back, so their
+  // costs added up while every other core idled: with a single FLANN index the
+  // build is ~0.54 s on the bench dataset and the cell assignment ~0.10 s, and
+  // that pair was the largest serial stretch of the run. Overlapped, it costs
+  // the maximum of the two instead of their sum.
+  //
+  // The team is capped at two threads because there are exactly two blocks to
+  // run. A wider team would park the surplus threads in the sections barrier
+  // for the whole build, which is free under OMP_WAIT_POLICY=PASSIVE but would
+  // burn ten cores' worth of CPU under ACTIVE -- and the harness asserts an
+  // upper bound on the run's cpu/wall ratio.
+  //
+  // Below two threads no parallel region is entered at all and the blocks run
+  // back to back in the original order. That is deliberate: the single-thread
+  // regime is the harness's measurement regime and it fails a threads=1 run
+  // whose cpu/wall ratio shows any concurrency.
+  //
+  // serial_prepare (--serial_prepare) forces that same straight-line order at
+  // any thread count. It exists so that the overlap can be switched off without
+  // also switching off the thread count: turning it off by running with one
+  // thread would change the parallelism of pass 2 and of the whole accuracy
+  // phase at the same time, which makes an A/B of *this* change impossible.
+  // With the flag, one binary produces both arms at twelve threads over the
+  // same input, which is both the measurement the deviation policy asks for and
+  // the strongest differential correctness test available for it.
+  //
+  // WHY THE INDEX SHAPE IS PART OF THE CONDITION. This overlap was written
+  // against a single pcl::search::KdTree, whose build contains no OpenMP at all
+  // and is therefore exactly the serial block a sections team can hide. With
+  // --nn_index partitioned the build is itself a parallel region over P
+  // sub-trees, and the benchmark harness runs with OMP_MAX_ACTIVE_LEVELS=1: a
+  // parallel region nested inside this sections team collapses to a single
+  // thread. Overlapping there would trade a build that costs 0.085 s on twelve
+  // threads for one that costs 0.54 s on one thread, in order to save the
+  // 0.097 s of cell assignment -- it would not merely fail to pay, it would
+  // silently switch the partitioned build off. Hiding the cell assignment
+  // behind a *parallel* build would need that build to join the caller's team
+  // rather than open a team of its own; until it does, the partitioned arm runs
+  // the two blocks back to back and --serial_prepare is a no-op on it.
+  const bool index_build_is_serial = requested_partitions <= 1;
+  if (!serial_prepare && index_build_is_serial && omp_get_max_threads() > 1) {
+#pragma omp parallel sections num_threads(2)
+    {
+#pragma omp section
+      BuildReconstructionIndex();
+#pragma omp section
+      AssignCells();
+    }
+  } else {
+    BuildReconstructionIndex();
+    AssignCells();
   }
+
+  // How well the partition boxes actually prune is a property of the scene, not
+  // of the code, and the whole reason the partitioned build is worth doing is
+  // that it stays near one sub-tree search per query. Measure it on a sample of
+  // the queries that are about to be run, report it -- a campaign that regresses
+  // here should say so in its own log rather than be inferred from a wall clock
+  // -- and go back to the single index when it has collapsed.
+  if (reconstruction_nn_index.partition_count() > 1) {
+    size_t probe_sample_count = 0;
+    const double searches_per_query = MeasureSubtreeSearchesPerQuery(
+        reconstruction_nn_index, *scan, &probe_sample_count);
+    std::fprintf(stderr,
+                 "nn_index: partitioned into %d sub-trees, %.4f sub-tree "
+                 "searches per query over a %zu point probe\n",
+                 reconstruction_nn_index.partition_count(), searches_per_query,
+                 probe_sample_count);
+    // Not under --nn_index both: that mode is asked for in order to compare the
+    // two shapes, so it must keep the shape it was asked to compare.
+    if (nn_index_kind == NnIndexKind::kPartitioned &&
+        searches_per_query > kMaxSubtreeSearchesPerQuery) {
+      std::fprintf(stderr,
+                   "nn_index: box pruning has collapsed on this scene (above "
+                   "%.2f); rebuilding as a single index\n",
+                   kMaxSubtreeSearchesPerQuery);
+      reconstruction_nn_index.BuildSingleIndex(reconstruction);
+    }
+  }
+
+  // --nn_index both: check the two shapes against each other over every scan
+  // point before the real pass, and say so on stderr. This is a validation
+  // mode; it pays for the serial build it exists to avoid, plus a second query
+  // pass, and nothing in it touches the values the real pass below computes.
+  if (nn_index_kind == NnIndexKind::kBoth) {
+    if (reconstruction_nn_index.partition_count() == 1) {
+      // Say so rather than report a vacuous zero: comparing the single index
+      // against itself proves nothing.
+      std::fprintf(stderr,
+                   "nn_index: nothing to compare, the reconstruction was not "
+                   "partitioned; force it with --nn_index_partitions\n");
+    } else {
+      ReconstructionNearestIndex reference_nn_index;
+      reference_nn_index.BuildSingleIndex(reconstruction);
+      long long int first_disagreement = 0;
+      const size_t disagreements =
+          CountIndexDisagreements(reconstruction_nn_index, reference_nn_index,
+                                  *scan, &first_disagreement);
+      if (disagreements == 0) {
+        std::fprintf(stderr,
+                     "nn_index: %zu of %zu scan points disagree between the "
+                     "partitioned and the single index\n",
+                     disagreements, scan->size());
+      } else {
+        std::fprintf(stderr,
+                     "nn_index: MISMATCH -- %zu of %zu scan points disagree "
+                     "between the partitioned and the single index, first at "
+                     "scan point %lld. Use --nn_index flann on this host.\n",
+                     disagreements, scan->size(), first_disagreement);
+      }
+    }
+  }
+
   const uint32_t* point_cell_ids_ptrs[kGridCount];
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
     point_cell_ids_ptrs[grid_index] =
