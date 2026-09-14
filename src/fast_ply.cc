@@ -188,10 +188,10 @@ std::uint32_t ScalarType(const std::string& type, PropertyKind* kind) {
 // ASCII or big-endian encodings, list properties inside the vertex element,
 // coordinates stored as double or as an integer type (PCL converts those, and
 // this reader will not guess at the rounding), an `obj_info` line (PCL maps it
-// onto the cloud dimensions and the sensor origin), a `camera` element carrying
-// data (PCL reads the sensor pose out of it -- verified), a `range_grid`
-// element carrying data, and any other element carrying data before the vertex
-// block or under a name PCL's point-cloud read path is not known to ignore.
+// onto the cloud dimensions and the sensor origin), a `range_grid` element
+// carrying data, and any other element carrying data before the vertex block or
+// under a name PCL's point-cloud read path is not known to ignore. A `camera`
+// element after the vertex block is accepted -- see the element branch below.
 bool ParseSupportedHeader(const std::vector<char>& buffer,
                           VertexLayout* layout,
                           std::uint64_t* data_offset) {
@@ -276,11 +276,25 @@ bool ParseSupportedHeader(const std::vector<char>& buffer,
       } else if (count > 0) {
         // An element carrying data BEFORE the vertex block moves the block, and
         // this reader does not walk variable-length element data to find it.
-        // After the block, only `face` is known -- and was verified on PCL 1.15
-        // -- to leave the loaded point cloud untouched; `camera` demonstrably
-        // does not (it sets the sensor pose), and `range_grid` has a documented
-        // role in PCL's reader, so both are declined.
-        if (!seen_vertex_element || current_element != "face") {
+        //
+        // After the block, `face` and `camera` are accepted. `face` was verified
+        // on PCL 1.15 to leave the loaded point cloud untouched. `camera` does
+        // set PCL's sensor_origin_ and sensor_orientation_ -- but nothing in
+        // this program reads either: scans are placed by the global_T_mesh
+        // matrices of the MeshLab project (main.cc), and the loader below zeroes
+        // the pose on every file regardless. So the one field that differs is
+        // one no output depends on.
+        //
+        // This is not a corner case. Every ETH3D ground-truth scan is written by
+        // PCL and carries `element camera 1`, so declining it put the entire
+        // benchmark -- the only data this program exists to score -- on the
+        // fallback path.
+        //
+        // `range_grid` stays declined: it has a documented role in PCL's reader
+        // and can change which vertices the loaded cloud ends up holding, which
+        // is a difference that would reach the result.
+        if (!seen_vertex_element ||
+            (current_element != "face" && current_element != "camera")) {
           return false;
         }
       }
