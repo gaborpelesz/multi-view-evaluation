@@ -279,14 +279,29 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // kd-tree, whose build is a single-threaded half second and which is kept
   // reachable as the reference implementation. Only one of the two is built
   // unless --nn_verify asked for both.
-  const bool use_grid = (nn_index == NnIndexKind::kGrid);
+  bool use_grid = (nn_index == NnIndexKind::kGrid);
+  bool verify_nn = nn_verify;
   ReconNnGrid reconstruction_grid;
-  if (use_grid || nn_verify) {
-    reconstruction_grid.Build(*reconstruction, maximum_tolerance,
-                              maximum_tolerance_squared);
+  if (use_grid || verify_nn) {
+    if (!reconstruction_grid.Build(*reconstruction, maximum_tolerance,
+                                   maximum_tolerance_squared)) {
+      // The grid refuses to index this cloud (its coordinates are so extreme
+      // that no power-of-two grid satisfies both the exactness guard and the
+      // cell budget). Say so on stderr and answer from the kd-tree, which has
+      // no such bound. Falling back silently would be worse than the crash it
+      // replaces: the number would still be printed, and nothing in the run
+      // record would say which index produced it.
+      std::fprintf(stderr,
+                   "nn_index: the grid cannot represent this reconstruction "
+                   "cloud (its coordinates leave the index's exact domain); "
+                   "answering from the kd-tree instead, as --nn_index flann "
+                   "would.\n");
+      use_grid = false;
+      verify_nn = false;
+    }
   }
   pcl::search::KdTree<pcl::PointXYZ> reconstruction_kdtree;
-  if (!use_grid || nn_verify) {
+  if (!use_grid || verify_nn) {
     // Get sorted results from radius search. True should be the default, but be
     // on the safe side for the case of changing defaults:
     reconstruction_kdtree.setSortedResults(true);
@@ -372,7 +387,7 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   const float* const sorted_tolerances_squared_ptr =
       sorted_tolerances_squared.data();
 
-  if (nn_verify) {
+  if (verify_nn) {
     VerifyNnIndices(*scan, reconstruction_grid, reconstruction_kdtree,
                     maximum_tolerance_squared, sorted_tolerances_squared_ptr,
                     tolerances_count);

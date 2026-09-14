@@ -55,6 +55,23 @@ constexpr double kMinCellsPerTolerance = 8.0;
 // that invariant is what licenses the pruning.
 constexpr double kMaxGridCoordinate = 4.0e15;
 
+// Coarsest grid the cell-size search below will consider. A cell 2^160 m
+// across is twenty orders of magnitude wider than the widest cloud of finite
+// float coordinates can be (|x| <= 3.403e38, so an extent of at most
+// ~6.8e38 m), so at this exponent every axis has one or two cells and the cell
+// budget is met by any cloud with at least two candidate points. The bound
+// therefore exists only so the loop cannot spin: reaching it means one of the
+// assumptions above is false, and Build then reports failure rather than
+// returning an index whose cell ids have silently wrapped.
+constexpr int kMinGridExponent = -160;
+
+// Largest candidate count the CSR layout can address. cell_start_ holds uint32
+// offsets into the point array, so the candidate set has to fit in the uint32
+// domain; 2^32 - 1 points is 51 GB of coordinates, far past what the machine
+// could hold, but the bound is asserted rather than assumed because violating
+// it would wrap an offset instead of failing.
+constexpr double kMaxCandidateCount = 4.0e9;
+
 // Sentinel cell id for a point that is not a search candidate.
 constexpr uint32_t kExcludedPoint = 0xFFFFFFFFu;
 
@@ -65,7 +82,7 @@ inline bool IsFinitePoint(const pcl::PointXYZ& point) {
 
 }  // namespace
 
-void ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
+bool ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
                         float maximum_tolerance_squared) {
   cap_squared_ = static_cast<double>(maximum_tolerance_squared);
 
@@ -109,8 +126,12 @@ void ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
 
   if (finite_count == 0) {
     // No candidate at all. Every query reports "nothing found", which is what
-    // FLANN does with an empty index too.
-    return;
+    // FLANN does with an empty index too. That is a valid index, not a
+    // failure.
+    return true;
+  }
+  if (static_cast<double>(finite_count) > kMaxCandidateCount) {
+    return false;
   }
 
   const double lower[3] = {static_cast<double>(min_x),
@@ -134,6 +155,9 @@ void ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
         std::max(largest_magnitude,
                  std::max(std::fabs(lower[axis]), std::fabs(upper[axis])));
   }
+  // The finest grid the exactness guard permits. largest_magnitude is at least
+  // one, so this is at most 51 and needs no upper clamp; the tolerance guard
+  // below and the budget search after it can only lower it.
   int exponent = static_cast<int>(
       std::floor(std::log2(kMaxGridCoordinate / largest_magnitude)));
   if (maximum_tolerance > 0.f && std::isfinite(maximum_tolerance)) {
@@ -142,27 +166,55 @@ void ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
         static_cast<int>(std::floor(std::log2(
             kMinCellsPerTolerance / static_cast<double>(maximum_tolerance)))));
   }
-  exponent = std::max(-60, std::min(60, exponent));
+  // There is deliberately NO lower clamp on the exponent. Clamping it upwards
+  // would hand back a grid FINER than the exactness guard permits, and the
+  // guard is the whole reason "a point stored in cell i lies inside cell i's
+  // box" is exact rather than approximate -- which is what licenses the
+  // pruning. Coarsening, which is all the loop below does, only shrinks the
+  // scaled coordinates, so it can never weaken the guard.
 
   double origin[3];
-  int64_t dim[3];
-  while (true) {
+  int64_t dim[3] = {1, 1, 1};
+  bool grid_fits = false;
+  for (; exponent >= kMinGridExponent; --exponent) {
     const double cell_size = std::ldexp(1.0, -exponent);
     const double inv_cell_size = std::ldexp(1.0, exponent);
+    // The axis dimensions stay in double until the budget test has passed.
+    // A double product cannot overflow or trap however absurd the scene's
+    // extent is, whereas converting an axis dimension to int64 is undefined
+    // once the value leaves int64's range -- and it does leave it, for a cloud
+    // whose coordinates reach 1e21 m at the exponent this search starts from.
+    double cell_dim[3];
     double cells = 1.0;
     for (int axis = 0; axis < 3; ++axis) {
       origin[axis] = std::floor(lower[axis] * inv_cell_size) * cell_size;
-      dim[axis] = static_cast<int64_t>(std::floor(
-                      (upper[axis] - origin[axis]) * inv_cell_size)) +
-                  1;
-      cells *= static_cast<double>(dim[axis]);
+      cell_dim[axis] =
+          std::floor((upper[axis] - origin[axis]) * inv_cell_size) + 1.0;
+      cells *= cell_dim[axis];
     }
-    if (cells <= cell_budget || exponent <= -60) {
-      cell_size_ = cell_size;
-      inv_cell_size_ = inv_cell_size;
-      break;
+    if (cells > cell_budget) {
+      continue;
     }
-    --exponent;
+    // Past this point the budget is met, and the budget is at most 2e9. That
+    // single fact is what puts every integer the index computes in domain:
+    // each axis dimension and their product fit in int64 with room to spare,
+    // the flat cell id computed in pass 1 fits in uint32 without truncation,
+    // and cell_start_ is an allocation of at most 8 GB rather than an
+    // unbounded one. The old loop could exit WITHOUT the budget being met, and
+    // then all three of those silently failed.
+    for (int axis = 0; axis < 3; ++axis) {
+      dim[axis] = static_cast<int64_t>(cell_dim[axis]);
+    }
+    cell_size_ = cell_size;
+    inv_cell_size_ = inv_cell_size;
+    grid_fits = true;
+    break;
+  }
+  if (!grid_fits) {
+    // Unreachable for any cloud of finite float coordinates (see
+    // kMinGridExponent), and a refusal rather than an assertion so that a
+    // violated assumption costs the caller the FLANN path, not a wrong number.
+    return false;
   }
   for (int axis = 0; axis < 3; ++axis) {
     origin_[axis] = origin[axis];
@@ -290,4 +342,5 @@ void ReconNnGrid::Build(const PointCloud& cloud, float maximum_tolerance,
   }
   cell_start_[static_cast<size_t>(total_cell_count_)] =
       static_cast<uint32_t>(finite_count);
+  return true;
 }
