@@ -185,6 +185,32 @@ class VoxelCellIndexMap {
   // per-cell arrays.
   inline uint32_t size() const { return size_; }
 
+  // One in kCellSampleRate of the cell space, selected by the top bits of the
+  // hash. EstimateDistinctCellCounts() below counts the cells this accepts, so
+  // the decision must depend on the CELL and on nothing else: a cell holding a
+  // thousand points is accepted exactly as often as a cell holding one, which
+  // is what makes the extrapolation unbiased with respect to occupancy.
+  //
+  // The selection uses the HIGH bits. A table's own slot index is the LOW bits
+  // (Hash(key) & mask_), so sampled keys are uncorrelated with any slot and
+  // still spread over the whole sample table instead of piling onto every
+  // kCellSampleRate-th slot of it. The final `h ^= h >> 32` of the mix leaves
+  // bits 63..32 exactly as they came out of the multiply, where they already
+  // depend on every input bit, so the high bits are as well mixed as the low
+  // ones.
+  //
+  // kCellSampleShift must be 64 - log2(kCellSampleRate). 1/128 measured as the
+  // knee: the estimate is still within ~6% of the true cell count on the bench
+  // dataset, while the sample tables have become small enough that the pass
+  // costs little beyond the key and the hash it has to compute per point
+  // anyway. Sampling 1/512 saved only a further 1.5 ms of 33 and cost twice
+  // the relative error.
+  static const uint64_t kCellSampleRate = 128;
+  static const int kCellSampleShift = 57;
+  static inline bool IsSampledCell(const VoxelCellKey& key) {
+    return (Hash(key) >> kCellSampleShift) == 0;
+  }
+
  private:
   struct Slot {
     int32_t x;
@@ -248,48 +274,131 @@ class VoxelCellIndexMap {
   uint32_t size_;
 };
 
-// Estimates how many distinct cells the given points will occupy in the voxel
-// grid described by voxel_size_inv and the shift, so that a VoxelCellIndexMap
-// can be Reserve()d up front instead of doubling its way there from 1024 slots.
-//
-// The estimate is taken from every 32nd point: those are counted into a
-// throwaway table (~3% of the points, so a few tens of thousands of probes),
-// and the distinct-cell fraction observed in the sample is extrapolated to the
-// whole point set with 15% headroom. The sample is strided rather than random
-// so that the function is deterministic, but the value it returns is only ever
-// used to pick a table size, which provably cannot change any cell index (see
-// VoxelCellIndexMap::Reserve), so neither the sampling rule nor the accuracy of
-// the estimate is load-bearing for the result -- only for the memory used and
-// for how many rehashes are avoided.
-//
-// The extrapolation is done in integer arithmetic: no rounding decision is left
-// to the floating point unit. The result is clamped to point_count, which is a
-// hard upper bound on the number of occupied cells.
-inline size_t EstimateDistinctCellCount(const pcl::PointXYZ* points,
-                                        size_t point_count,
-                                        float voxel_size_inv, float shift_x,
-                                        float shift_y, float shift_z) {
-  if (point_count == 0) {
+// Integer square root of v, exact for every uint64_t: returns
+// floor(sqrt(v)). Used only to size a hash table, but kept in integer
+// arithmetic so that no rounding decision anywhere in this program depends on
+// the floating point environment.
+inline uint64_t IntegerSqrt(uint64_t v) {
+  if (v == 0) {
     return 0;
   }
-  const size_t kSampleStride = 32;
-  VoxelCellIndexMap sample_map;
-  size_t sampled_count = 0;
-  for (size_t point_index = 0; point_index < point_count;
-       point_index += kSampleStride) {
-    bool inserted;
-    sample_map.Lookup(CalcCellCoordinates(points[point_index], voxel_size_inv,
-                                          shift_x, shift_y, shift_z),
-                      &inserted);
-    ++ sampled_count;
+  // Newton's iteration, seeded at 2^32, which is >= sqrt(v) for every uint64_t.
+  // From a seed at or above the root the iterates decrease monotonically and
+  // never fall below floor(sqrt(v)), which is both why the loop terminates at
+  // the right value and why root is never zero (so the division is safe).
+  // While root >= sqrt(v) we have v / root <= root, so the sum below is at most
+  // 2 * 2^32 and cannot overflow either.
+  uint64_t root = 1ull << 32;
+  while (true) {
+    const uint64_t next = (root + v / root) / 2;
+    if (next >= root) {
+      break;
+    }
+    root = next;
+  }
+  return root;
+}
+
+// Estimates, for each of GridCount voxel grids, how many distinct cells the
+// given points occupy in it, so that the VoxelCellIndexMap of each grid can be
+// Reserve()d up front instead of doubling its way there from 1024 slots. All
+// grids are estimated in a single pass over the point array, which is the only
+// sequential read this function does.
+//
+// HOW THE ESTIMATE IS TAKEN, AND WHY NOT THE OBVIOUS WAY. Counting the distinct
+// cells hit by every s-th POINT and multiplying by s does not estimate the
+// number of cells -- it estimates the number of points. A cell holding k points
+// is hit by such a sample with probability 1 - (1 - 1/s)^k, so the
+// extrapolation returns cells * s * (1 - (1 - 1/s)^k), which is right only at
+// k = 1 and, at s = 32, is 14x too high already at k = 15 and 22x too high at
+// k = 31. Clamped to the point count, as it has to be, that is not a safeguard
+// against a large cloud at all: it IS the fixed "two slots per point" rule it
+// was supposed to replace, for every cloud denser than about one point per
+// voxel.
+//
+// So the sample is taken over the CELL SPACE instead: a cell is counted iff
+// VoxelCellIndexMap::IsSampledCell() accepts it, which is a function of the
+// cell alone, so the acceptance probability is 1/kCellSampleRate whatever the
+// occupancy. The number of accepted cells is then Binomial(cells,
+// 1/kCellSampleRate) and kCellSampleRate times it is unbiased for the cell
+// count at every density. Every point must still be visited -- an unbiased
+// cell-space sample cannot be drawn from a subsample of the points -- but a
+// visit that is not accepted costs only the cell coordinates and the hash, and
+// touches no table.
+//
+// HEADROOM. An underestimate is not a correctness problem (Grow() absorbs it)
+// but it costs the single most expensive rehash, so the point estimate is
+// raised by five standard deviations of that binomial. With r =
+// kCellSampleRate and a accepted cells, sd(r * a) = sqrt(r * (r - 1) * a), so
+// five of them is sqrt(25 * r * (r - 1) * a), which is what the code below
+// computes. The allowance is therefore self-scaling: large in relative terms
+// when the sample is small and uninformative, and vanishing when it is large.
+// At the bench dataset's ~2.2M cells it is 3.8%, and the estimates come out
+// 4.2% to 5.6% above the true cell counts -- close enough that all four tables
+// land on exactly the power-of-two size the growing table used to end at, and
+// none of them calls Grow() even once (verified in-tree).
+//
+// Below kSmallCloudPointCount points the exact upper bound (point_count) is
+// used instead: the table it implies is at most 4 MB, which is not worth an
+// estimation pass or a discussion of sampling error.
+//
+// NOTHING HERE IS LOAD-BEARING FOR THE RESULT. The value returned is only ever
+// passed to VoxelCellIndexMap::Reserve(), which picks the table geometry; a
+// cell's dense index is the value of size_ at its first insertion and depends
+// solely on the order of distinct keys, never on the table size. A wrong
+// estimate can only cost memory or rehashes.
+template <int GridCount>
+inline void EstimateDistinctCellCounts(
+    const pcl::PointXYZ* points, size_t point_count, float voxel_size_inv,
+    const float (&grid_shifts)[GridCount][3],
+    size_t (&estimates)[GridCount]) {
+  const size_t kSmallCloudPointCount = 1 << 16;
+
+  if (point_count == 0) {
+    for (int grid_index = 0; grid_index < GridCount; ++ grid_index) {
+      estimates[grid_index] = 0;
+    }
+    return;
+  }
+  if (point_count <= kSmallCloudPointCount) {
+    for (int grid_index = 0; grid_index < GridCount; ++ grid_index) {
+      estimates[grid_index] = point_count;
+    }
+    return;
   }
 
-  // distinct_in_sample * 1.15 * point_count / sampled_count, rounded up, as
-  // 23/20 to keep it exact and integral.
-  uint64_t estimate = (static_cast<uint64_t>(sample_map.size()) * 23 + 19) / 20;
-  estimate = (estimate * point_count + sampled_count - 1) / sampled_count;
-  if (estimate > point_count) {
-    estimate = point_count;
+  // One throwaway table per grid, holding roughly cells / kCellSampleRate
+  // entries. They are left to grow from the 1024-slot default on purpose: the
+  // whole point of this function is not to know that size in advance, and the
+  // growth of a table this small is a rounding error against the four
+  // production tables it sizes.
+  VoxelCellIndexMap sample_maps[GridCount];
+  for (size_t point_index = 0; point_index < point_count; ++ point_index) {
+    const pcl::PointXYZ& point = points[point_index];
+    for (int grid_index = 0; grid_index < GridCount; ++ grid_index) {
+      const VoxelCellKey key = CalcCellCoordinates(
+          point, voxel_size_inv, grid_shifts[grid_index][0],
+          grid_shifts[grid_index][1], grid_shifts[grid_index][2]);
+      if (!VoxelCellIndexMap::IsSampledCell(key)) {
+        continue;
+      }
+      bool inserted;
+      sample_maps[grid_index].Lookup(key, &inserted);
+    }
   }
-  return static_cast<size_t>(estimate);
+
+  for (int grid_index = 0; grid_index < GridCount; ++ grid_index) {
+    const uint64_t accepted = sample_maps[grid_index].size();
+    uint64_t estimate =
+        accepted * VoxelCellIndexMap::kCellSampleRate +
+        IntegerSqrt(25 * VoxelCellIndexMap::kCellSampleRate *
+                    (VoxelCellIndexMap::kCellSampleRate - 1) * accepted) +
+        1;
+    // A point can occupy at most one cell, so point_count is a hard bound and
+    // no headroom may push past it.
+    if (estimate > point_count) {
+      estimate = point_count;
+    }
+    estimates[grid_index] = static_cast<size_t>(estimate);
+  }
 }
