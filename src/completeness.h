@@ -34,6 +34,16 @@
 #include "meshlab_project.h"
 #include "util.h"
 
+// Which nearest neighbour index the completeness pass queries. Both answer the
+// same question and are required to return the same float; kGrid is the fast
+// one and kFlann is the original pcl::search::KdTree, kept reachable so that a
+// host on which the two disagree can fall back to the reference implementation
+// and so that the two can be run against each other (see --nn_verify).
+enum class NnIndexKind {
+  kGrid,
+  kFlann
+};
+
 // Computes the completeness of the reconstruction with respect to the given
 // scans.
 void ComputeCompleteness(
@@ -43,6 +53,12 @@ void ComputeCompleteness(
     float voxel_size_inv,
     // Sorted by increasing tolerance.
     const std::vector<float>& sorted_tolerances,
+    // Which nearest neighbour index to query.
+    NnIndexKind nn_index,
+    // If true, query BOTH indices over every scan point first and report how
+    // often they disagree, aborting if the disagreement could change a
+    // classification. Off during measurement; it doubles the work.
+    bool nn_verify,
     // Indexed by: [tolerance_index]. Range: [0, 1].
     std::vector<float>* results,
     // Indexed by: [tolerance_index][scan_point_index].

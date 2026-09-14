@@ -28,8 +28,17 @@
 
 #include "accuracy.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <sstream>
+
 #include <Eigen/StdVector>
-#include <pcl/io/ply_io.h>
+
+#include "fast_ply.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // Number of cells used for the spatial access structure in inclination and
 // azimuth directions.
@@ -47,15 +56,62 @@ typedef std::vector<Eigen::Matrix3f, Eigen::aligned_allocator<Eigen::Matrix3f>>
 typedef std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>
     Vector3fVector;
 
-// Accuracy results for one voxel cell.
-struct AccuracyCell {
-  inline AccuracyCell() : accurate_count(0), inaccurate_count(0) {}
+// Accuracy tallies for one differently-shifted voxel grid.
+//
+// This used to be std::unordered_map<std::tuple<int, int, int>,
+// std::vector<AccuracyCell>>, where every cell was a separately malloc'd hash
+// node holding a std::vector with a second malloc of its own. Here the cell
+// coordinates are resolved to a dense cell id by an open-addressing table
+// (VoxelCellIndexMap) and the per-cell tallies live in flat arrays addressed by
+// that id, so a cell costs no allocation of its own and a tally is an indexed
+// store into contiguous memory instead of a pointer chase.
+//
+// The ids are handed out in first-touch order over the reconstruction points,
+// so walking the flat arrays from 0 upwards visits the cells in exactly the
+// order in which the original implementation created them. That is what keeps
+// the floating point summation at the end of ComputeAccuracy in its original
+// order.
+//
+// The tallies are histograms of the first tolerance index for which a point is
+// accurate rather than per-tolerance counts: that is one increment per point
+// and grid instead of one per tolerance, and it is what lets the classification
+// loop run in parallel with a single atomic per grid. The per-tolerance
+// accurate and inaccurate counts the original code kept are formed from the
+// histograms afterwards and are identical to them.
+struct AccuracyCellGrid {
+  // Returns the dense id of the cell with the given coordinates, creating it if
+  // it does not exist yet. Only ever called from the serial pass, which is what
+  // makes the dense ids deterministic.
+  inline uint32_t GetCell(const VoxelCellKey& key) {
+    bool inserted;
+    return map_.Lookup(key, &inserted);
+  }
 
-  // Number of accurate reconstruction points within this cell.
-  size_t accurate_count;
+  // Asks the hardware to fetch the table slot this key would probe first. A
+  // pure performance hint with no effect on what GetCell later returns.
+  inline void Prefetch(const VoxelCellKey& key) const { map_.Prefetch(key); }
 
-  // Number of inaccurate reconstruction points within this cell.
-  size_t inaccurate_count;
+  // Sizes the cell table for an expected number of cells, before the serial
+  // pass starts inserting. Only the table geometry changes; the ids handed out
+  // do not depend on it.
+  inline void Reserve(size_t expected_cells) { map_.Reserve(expected_cells); }
+
+  inline size_t cell_count() const { return map_.size(); }
+
+  // Histogram of the first tolerance index for which a reconstruction point of
+  // this cell is accurate; bin tolerances_count collects the points which are
+  // accurate for no tolerance at all. Sized once, after the serial pass has
+  // seen every cell, so that the parallel pass can increment it in place
+  // without ever reallocating.
+  // Indexed by: [cell_id * (tolerances_count + 1) + tolerance_index].
+  std::vector<uint32_t> accurate_histogram;
+
+  // The same histogram, restricted to the points which additionally produced
+  // inaccurate classifications.
+  std::vector<uint32_t> inaccurate_histogram;
+
+ private:
+  VoxelCellIndexMap map_;
 };
 
 // Modulo which works properly for negative k (in contrast to C++' % operator),
@@ -107,10 +163,29 @@ struct SphericalPointAndDirection {
   float azimuth;
 };
 
-typedef std::vector<SphericalPointAndDirection> SphericalPointAndDirectionCloud;
+// The subset of SphericalPointAndDirection that ClassifyPoint actually reads,
+// stored by value inside the grid (see SphericalPointGrid). Keeping only these
+// 28 bytes per scan point, contiguously and in cell order, means the beam test
+// walks a cell's points sequentially with no indirection.
+struct GridScanPoint {
+  // Read for every candidate point (the beam test starts with this dot
+  // product), therefore placed first.
+  Eigen::Vector3f direction;
+  // Read only for points that fall inside the beam volume.
+  Eigen::Vector3f point;
+  float radius;
+};
 
-// Stores SphericalPointAndDirection in a grid defined on azimuth and
-// inclination for fast direction-based access.
+// Stores the scan points in a grid defined on azimuth and inclination for fast
+// direction-based access.
+//
+// The storage is a CSR / bucketed layout: one contiguous array of points in
+// cell order plus an offsets array of cell_count + 1 entries, so cell c owns
+// points_[cell_offsets_[c] .. cell_offsets_[c + 1]). This replaces a
+// std::vector<std::vector<SphericalPointAndDirection*>>, which cost a 24-byte
+// vector header for each of the 2,097,152 cells (~50 MB per scan before a
+// single point is stored), one heap allocation per non-empty cell, and two
+// pointer chases per visited point.
 class SphericalPointGrid {
   friend class SphericalPointGridIterator;
 
@@ -120,15 +195,10 @@ class SphericalPointGrid {
         cell_extent_azimuth_(2 * M_PI / cell_count_azimuth_),
         cell_count_inclination_(cell_count_inclination),
         cell_extent_inclination_(M_PI / cell_count_inclination) {
-    cells_.resize(cell_count_azimuth_ * cell_count_inclination_);
+    cell_offsets_.assign(
+        static_cast<size_t>(cell_count_azimuth_) * cell_count_inclination_ + 1,
+        0u);
   }
-
-  inline SphericalPointGrid(const SphericalPointGrid& other)
-      : cell_count_azimuth_(other.cell_count_azimuth_),
-        cell_extent_azimuth_(other.cell_extent_azimuth_),
-        cell_count_inclination_(other.cell_count_inclination_),
-        cell_extent_inclination_(other.cell_extent_inclination_),
-        cells_(other.cells_) {}
 
   inline void CellCoordinatesWithoutWrap(float azimuth, float inclination,
                                          int* cell_index_azimuth,
@@ -164,21 +234,97 @@ class SphericalPointGrid {
     return CellCoordinatesToIndex(cell_index_azimuth, cell_index_inclination);
   }
 
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      int cell_index) const {
-    return cells_[cell_index];
+  // Converts the given scan cloud to spherical coordinates and fills the grid
+  // with it.
+  //
+  // This is a counting sort of the points by cell index. Pass 1 converts each
+  // point, pass 2 histograms the cells, the histogram is prefix-summed into the
+  // offsets array, and pass 3 scatters the points into the contiguous array.
+  // The scatter walks the points in increasing point index and appends to each
+  // cell's running cursor, so it is stable: within a cell, the points end up in
+  // increasing point index order, which is exactly the order the previous
+  // push_back-based construction produced. The order in which ClassifyPoint
+  // visits a cell's points is therefore unchanged. Every pass here is serial
+  // and in point order; the parallelism is one level up, across scans (see
+  // ComputeAccuracy), so a Build call is a single thread's unit of work.
+  void Build(const PointCloud& cartesian_cloud) {
+    const size_t point_count = cartesian_cloud.size();
+    const size_t cell_count = cell_offsets_.size() - 1;
+
+    // Scratch storage, freed before the next scan's grid is built.
+    std::vector<GridScanPoint> unsorted_points(point_count);
+    std::vector<uint32_t> point_cell_indices(point_count);
+
+    std::fill(cell_offsets_.begin(), cell_offsets_.end(), 0u);
+
+    // Pass 1: spherical conversion and cell index computation. The conversion
+    // and the cell index computation are the unchanged original code, so every
+    // point lands in the same cell with the same field values as before.
+    //
+    // This loop used to carry its own `omp parallel for`. It no longer does,
+    // because the caller now runs whole Build calls in parallel: an inner
+    // region would be nested inside that one, and the benchmark harness sets
+    // OMP_MAX_ACTIVE_LEVELS=1, so the inner team would collapse to a single
+    // thread anyway while still paying a fork/join per scan. Splitting the
+    // work by scan keeps every thread on one scan's private data, which is
+    // also friendlier to the caches than twelve threads sharing one scan's
+    // 8 MiB offsets array.
+    const long long int signed_point_count =
+        static_cast<long long int>(point_count);
+    for (long long int p = 0; p < signed_point_count; ++p) {
+      const SphericalPointAndDirection spherical_point(
+          cartesian_cloud.at(p).getVector3fMap());
+
+      GridScanPoint& grid_point = unsorted_points[p];
+      grid_point.direction = spherical_point.direction;
+      grid_point.point = spherical_point.point;
+      grid_point.radius = spherical_point.radius;
+
+      point_cell_indices[p] = static_cast<uint32_t>(
+          CellIndex(spherical_point.azimuth, spherical_point.inclination));
+    }
+
+    // Pass 2 (serial): the per-cell histogram. Integer counting only; it stays
+    // serial because a private copy of the histogram would cost one array of
+    // cell_count entries per thread.
+    for (size_t p = 0; p < point_count; ++p) {
+      ++cell_offsets_[point_cell_indices[p]];
+    }
+
+    // Exclusive prefix sum: cell_offsets_[c] becomes the start of cell c.
+    uint32_t running_offset = 0;
+    for (size_t c = 0; c < cell_count; ++c) {
+      const uint32_t count = cell_offsets_[c];
+      cell_offsets_[c] = running_offset;
+      running_offset += count;
+    }
+    cell_offsets_[cell_count] = running_offset;
+
+    // Pass 3: stable scatter. This consumes cell_offsets_[c], advancing it to
+    // the end of cell c.
+    points_.resize(point_count);
+    for (size_t p = 0; p < point_count; ++p) {
+      points_[cell_offsets_[point_cell_indices[p]]++] = unsorted_points[p];
+    }
+
+    // Shift the consumed cursors back into start-of-cell form. Afterwards
+    // cell_offsets_[c] is the start of cell c again, and the final entry still
+    // holds point_count (no point index can equal cell_count, so the scatter
+    // never touched it).
+    for (size_t c = cell_count; c > 0; --c) {
+      cell_offsets_[c] = cell_offsets_[c - 1];
+    }
+    cell_offsets_[0] = 0;
   }
-  inline const std::vector<SphericalPointAndDirection*>& cell(
-      float azimuth, float inclination) const {
-    return cells_[CellIndex(azimuth, inclination)];
+
+  // The contiguous point array. May be null for an empty scan, in which case
+  // every cell range is empty as well.
+  inline const GridScanPoint* points_data() const { return points_.data(); }
+  inline uint32_t cell_start(int cell_index) const {
+    return cell_offsets_[cell_index];
   }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      int cell_index) {
-    return &cells_[cell_index];
-  }
-  inline std::vector<SphericalPointAndDirection*>* cell_mutable(
-      float azimuth, float inclination) {
-    return &cells_[CellIndex(azimuth, inclination)];
+  inline uint32_t cell_end(int cell_index) const {
+    return cell_offsets_[cell_index + 1];
   }
 
  private:
@@ -187,11 +333,12 @@ class SphericalPointGrid {
   int cell_count_inclination_;
   float cell_extent_inclination_;
 
-  // Indexed by: [cell_index_azimuth + cell_count_azimuth *
-  //              cell_index_inclination][point_index] .
-  // The points are not owned and must remain valid for the lifetime of this
-  // object.
-  std::vector<std::vector<SphericalPointAndDirection*>> cells_;
+  // CSR layout of the scan points. cell_offsets_ has cell_count + 1 entries,
+  // indexed by [cell_index_azimuth + cell_count_azimuth *
+  // cell_index_inclination]; the points of that cell are
+  // points_[cell_offsets_[i] .. cell_offsets_[i + 1]).
+  std::vector<uint32_t> cell_offsets_;
+  std::vector<GridScanPoint> points_;
 };
 
 // Iterates over an azimuth-inclination range in a SphericalPointGrid.
@@ -310,12 +457,13 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
       &point_grid, spherical_reconstruction_point.azimuth,
       spherical_reconstruction_point.inclination, relevancy_angle_horizontal,
       relevancy_angle_vertical);
+  const GridScanPoint* grid_points = point_grid.points_data();
   while (it.Next()) {
-    const std::vector<SphericalPointAndDirection*>& cell_points =
-        point_grid.cell(it.cell_index());
-    for (size_t point_index = 0, point_count = cell_points.size();
-         point_index < point_count; ++point_index) {
-      SphericalPointAndDirection* scan_point = cell_points[point_index];
+    const int cell_index = it.cell_index();
+    const uint32_t cell_end = point_grid.cell_end(cell_index);
+    for (uint32_t point_index = point_grid.cell_start(cell_index);
+         point_index < cell_end; ++point_index) {
+      const GridScanPoint* scan_point = grid_points + point_index;
 
       // Is the reconstruction point within the beam volume? (Checked by testing
       // whether the scan ray is closer than beam_radius to the reconstruction
@@ -363,6 +511,122 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
   }
 }
 
+// Keeps GridBuildThreadCount() out of line.
+//
+// MEASURED, NOT DEFENSIVE. ComputeAccuracy is one very large function: the
+// serial cell-id pass and the parallel classification loop (pass 2) share it.
+// When GridBuildThreadCount is inlined into it, the function crosses a
+// threshold in the inliner's budget and pass 2 comes out measurably worse --
+// on the bench dataset at 12 threads the accuracy phase goes from 0.180 s to
+// 0.248 s, a 38% regression in a phase this campaign spent two optimizations
+// shrinking, and the whole program from 0.395 s to 0.463 s. The effect is a
+// property of THIS combination: the same helper on opt/combo-c, before the
+// voxel-presize work reshaped the cell-id pass, cost nothing.
+//
+// Any perturbation of the function moves it back to the fast side -- a
+// temporary probe timer, an early `getenv` return, this attribute -- which is
+// what identifies the cause as the inlining decision rather than the helper's
+// own cost. The attribute states the intent directly instead of relying on an
+// accident of source layout to keep the fast codegen.
+//
+// It cannot change what is computed: it constrains only where the call is
+// emitted, never the value returned, and the returned value is a thread count
+// that the loop's independent iterations make unobservable in the output.
+#if defined(__GNUC__) || defined(__clang__)
+#define MVE_NOINLINE __attribute__((noinline))
+#else
+#define MVE_NOINLINE
+#endif
+
+// Scratch bytes SphericalPointGrid::Build holds per scan point for the whole
+// call: the converted-but-not-yet-binned points plus their cell indices.
+const size_t kGridBuildScratchBytesPerPoint =
+    sizeof(GridScanPoint) + sizeof(uint32_t);
+
+// Scratch always allowed in flight, whatever the scene. Small scenes -- the
+// benchmark datasets among them -- must never be throttled by the cap, and half
+// a gibibyte is both far above anything they reach and a bounded amount to add
+// to a host that is not memory constrained.
+const size_t kGridBuildScratchFloorBytes = static_cast<size_t>(512) << 20;
+
+// How many of the per-scan spherical grids ComputeAccuracy may build at once.
+//
+// Build's scratch is freed when it returns, but it is live for the whole call,
+// so building S scans on P threads holds P copies of it at once -- and holds
+// them at the same time as every grid already finished, which is the working
+// set this phase cannot avoid. Uncapped, that is a memory multiplier the serial
+// loop never had: on a scene with 5M-point scans a 12-thread host would add
+// 12 * 5M * 32 B = ~1.9 GB of transient scratch to a ~4.5 GB grid working set,
+// purely as a consequence of parallelising the loop. An out-of-memory kill
+// there is recorded by the benchmark harness as a failure of the method under
+// test, not as a cost of this optimization, so the multiplier has to be bounded
+// rather than merely documented.
+//
+// Bound the scratch, not the thread count: allow at most a quarter of the
+// memory the grids themselves will occupy once built, and never less than the
+// floor above. Expressing the cap relative to the phase's own unavoidable
+// footprint is what keeps it useful at both ends -- it never binds on the
+// benchmark scenes (3 scans of ~1.06M points need ~102 MB of scratch against a
+// 512 MB floor), and on the 30-scan campaign scene above it admits 6 threads
+// instead of 12, halving the added peak while keeping most of the speedup.
+//
+// The result is a function of the input alone -- the scan sizes, the scan count
+// and the OpenMP thread limit -- and never of the host's free memory, so the
+// thread count a given run uses is reproducible, which a measurement tool
+// requires. It cannot change what is computed either: the loop iterations are
+// independent, so the number of threads that run them is not observable in the
+// output.
+// Kept out of line deliberately; see MVE_NOINLINE above. This is a one-off
+// preparation call whose cost is three integer divisions, so nothing is lost by
+// not inlining it -- and a great deal is lost by inlining it, because
+// ComputeAccuracy also contains the parallel classification loop (pass 2) that
+// dominates the phase.
+MVE_NOINLINE static int GridBuildThreadCount(
+    const std::vector<PointCloudPtr>& scans) {
+  int max_threads = 1;
+#ifdef _OPENMP
+  max_threads = omp_get_max_threads();
+#endif
+  const size_t scan_count = scans.size();
+  // num_threads() requires a positive argument, so never return zero -- which
+  // is also what an empty scan list has to yield.
+  const size_t thread_count =
+      std::min(static_cast<size_t>(std::max(1, max_threads)), scan_count);
+  if (thread_count <= 1) {
+    return 1;
+  }
+
+  size_t total_points = 0;
+  size_t max_points = 0;
+  for (const PointCloudPtr& scan : scans) {
+    const size_t scan_points = scan->size();
+    total_points += scan_points;
+    max_points = std::max(max_points, scan_points);
+  }
+  if (max_points == 0) {
+    return 1;
+  }
+
+  // What the grids weigh after the loop: the points in CSR order, plus one
+  // dense offsets array per scan.
+  const size_t offsets_bytes =
+      (static_cast<size_t>(kCellCountAzimuth) * kCellCountInclination + 1) *
+      sizeof(uint32_t);
+  const size_t grid_bytes = total_points * sizeof(GridScanPoint) +
+                            scan_count * offsets_bytes;
+
+  const size_t scratch_budget =
+      std::max(kGridBuildScratchFloorBytes, grid_bytes / 4);
+  // The largest scan sets the per-thread cost, because dynamic scheduling may
+  // hand it to any thread at any time.
+  const size_t scratch_per_thread =
+      max_points * kGridBuildScratchBytesPerPoint;
+  const size_t affordable_threads =
+      std::max<size_t>(1, scratch_budget / scratch_per_thread);
+
+  return static_cast<int>(std::min(thread_count, affordable_threads));
+}
+
 void ComputeAccuracy(
     const MeshLabMeshInfoVector& scan_infos,
     const std::vector<PointCloudPtr>& scans, const PointCloud& reconstruction,
@@ -407,27 +671,30 @@ void ComputeAccuracy(
   }
 
   // Transform all scan points to spherical coordinates, and sort them into grid
-  // cells defined on the spherical coordinates.
-  std::vector<SphericalPointAndDirectionCloud> spherical_clouds(scan_count);
+  // cells defined on the spherical coordinates. The grid owns the points, so no
+  // separate spherical point cloud is kept alongside it.
+  //
+  // One scan per thread. Each iteration constructs and fills point_grids[i]
+  // from scans[i] and from nothing else: the grids are independent objects, no
+  // scan's Build reads or writes another scan's grid, and nothing is reduced
+  // across scans here. The vector is sized before the loop, so the element
+  // assignments below never reallocate it and never race. dynamic,1 because
+  // scans differ in point count and the loop trip count is small (a handful of
+  // scans on the benchmark dataset, twenty to forty on a real ETH3D scene).
+  //
+  // The team size is capped so that the scratch Build holds while it runs stays
+  // bounded however many threads and however large the scans are; see
+  // GridBuildThreadCount. On the benchmark scenes the cap does not bind.
   std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
-  for (size_t scan_index = 0; scan_index < scan_count; ++scan_index) {
+  const long long int signed_scan_count =
+      static_cast<long long int>(scan_count);
+  const int grid_build_threads = GridBuildThreadCount(scans);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(grid_build_threads)
+  for (long long int scan_index = 0; scan_index < signed_scan_count;
+       ++scan_index) {
     point_grids[scan_index].reset(
         new SphericalPointGrid(kCellCountAzimuth, kCellCountInclination));
-
-    const PointCloud& cartesian_cloud = *scans[scan_index];
-    SphericalPointAndDirectionCloud* spherical_cloud =
-        &spherical_clouds[scan_index];
-    spherical_cloud->resize(cartesian_cloud.size());
-    for (size_t p = 0; p < cartesian_cloud.size(); ++p) {
-      const pcl::PointXYZ& cartesian_point = cartesian_cloud.at(p);
-      SphericalPointAndDirection* spherical_point = &spherical_cloud->at(p);
-      *spherical_point =
-          SphericalPointAndDirection(cartesian_point.getVector3fMap());
-
-      point_grids[scan_index]
-          ->cell_mutable(spherical_point->azimuth, spherical_point->inclination)
-          ->push_back(spherical_point);
-    }
+    point_grids[scan_index]->Build(*scans[scan_index]);
   }
 
   // Prepare point_is_accurate, if requested.
@@ -441,27 +708,147 @@ void ComputeAccuracy(
   }
 
   // Differently shifted voxel grids.
-  // Indexed by: [map_index][CalcCellCoordinates(...)][tolerance_index].
-  std::unordered_map<std::tuple<int, int, int>, std::vector<AccuracyCell>>
-      cell_maps[kGridCount];
+  // Indexed by: [map_index], then by the dense cell id that the grid assigns to
+  // CalcCellCoordinates(...), then by [tolerance_index].
+  AccuracyCellGrid cell_maps[kGridCount];
 
-  // Loop over the reconstruction points.
-  for (size_t point_index = 0, size = reconstruction.size(); point_index < size;
+  // std::vector<AccuracyResult> is a byte array, so different threads writing
+  // different point indices write to distinct memory locations.
+  std::vector<AccuracyResult*> point_results(tolerances_count, nullptr);
+  if (output_point_results) {
+    for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+         ++tolerance_index) {
+      point_results[tolerance_index] =
+          point_is_accurate->at(tolerance_index).data();
+    }
+  }
+
+  const long long int reconstruction_size =
+      static_cast<long long int>(reconstruction.size());
+
+  // Pass 1 (serial): assign every reconstruction point the cell it falls into,
+  // in both voxel grids, walking the points in their original order. This
+  // creates exactly the cells the original implementation created, in exactly
+  // the same sequence, and hands out the dense cell ids in that same
+  // first-touch order, so the order of the floating point summation over the
+  // cells at the end of this function is unchanged. Only integer bookkeeping
+  // happens here; the expensive classification is done in pass 2, in parallel.
+  //
+  // This pass is also what makes the parallel pass safe without a lock: after
+  // it, every cell that will ever be touched exists and has a fixed id, so the
+  // flat tally arrays can be sized once and never reallocate again.
+  // Indexed by: [grid_index * reconstruction_size + point_index]. Grid-major,
+  // so that each grid's ids are one sequential write stream; the point-major
+  // layout this used to have interleaved the two grids and made both streams
+  // strided. The array is not read until pass 1 has finished, so only the
+  // address an already-determined id is stored at changes.
+  std::vector<uint32_t> point_cell_ids(
+      static_cast<size_t>(reconstruction_size) * kGridCount);
+  // Size both cell tables before anything is inserted. Left to grow from its
+  // 1024-slot default, each table doubles its way up to millions of slots and
+  // re-probes every cell it holds at every doubling, which costs more random
+  // probes than answering the lookups does. The estimate is a sample of the
+  // cell space rather than of the points, so it tracks the number of cells at
+  // any density and each table ends up the size it would have grown to anyway.
+  size_t expected_cells[kGridCount];
+  EstimateDistinctCellCounts(reconstruction.points.data(),
+                             static_cast<size_t>(reconstruction_size),
+                             voxel_size_inv, kGridShifts, expected_cells);
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    cell_maps[grid_index].Reserve(expected_cells[grid_index]);
+  }
+  // Both grids are walked together, one point at a time. kGridCount is a
+  // compile-time 2, so the grid loop unrolls and the point array is streamed
+  // once instead of once per grid. Every grid keeps its own table, its own id
+  // stream and its own memo below, and never reads another grid's state, so
+  // interleaving the two cannot change either grid's sequence of first-touched
+  // cells -- each still sees the points in strictly ascending index order.
+  uint32_t* grid_cell_ids[kGridCount];
+  // If a point falls into the same voxel as the previous one, remembering that
+  // cell saves a table lookup. How often that happens is entirely a property of
+  // the input's point order (measured on the bench dataset: ~0% here, because
+  // the reconstruction cloud is shuffled, but ~7% on the scan cloud in
+  // ComputeCompleteness, which is still in scanline order), so the memo is kept
+  // for the ordered case and is cheap when it never fires. The cell a point
+  // lands in is unaffected either way: the memo only short-circuits a lookup
+  // that would have returned the very same id.
+  VoxelCellKey previous_key[kGridCount];
+  uint32_t previous_id[kGridCount];
+  bool have_previous[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    grid_cell_ids[grid_index] =
+        point_cell_ids.data() +
+        static_cast<size_t>(grid_index) * reconstruction_size;
+    previous_key[grid_index] = VoxelCellKey{0, 0, 0};
+    previous_id[grid_index] = 0;
+    have_previous[grid_index] = false;
+  }
+
+  // The lookups themselves are random accesses into a 134 MB table and miss
+  // cache almost every time, while the points are read sequentially, so the key
+  // of a point some distance ahead can be computed for free and its table slot
+  // fetched while the current point is being resolved. 12 points ahead measured
+  // best in the 8-16 range.
+  const long long int kPrefetchDistance = 12;
+
+  for (long long int point_index = 0; point_index < reconstruction_size;
+       ++point_index) {
+    if (point_index + kPrefetchDistance < reconstruction_size) {
+      const pcl::PointXYZ& ahead_point =
+          reconstruction.at(point_index + kPrefetchDistance);
+      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+        cell_maps[grid_index].Prefetch(CalcCellCoordinates(
+            ahead_point, voxel_size_inv, kGridShifts[grid_index][0],
+            kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
+      }
+    }
+
+    const pcl::PointXYZ& point = reconstruction.at(point_index);
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      const VoxelCellKey key = CalcCellCoordinates(
+          point, voxel_size_inv, kGridShifts[grid_index][0],
+          kGridShifts[grid_index][1], kGridShifts[grid_index][2]);
+      uint32_t cell_id;
+      if (have_previous[grid_index] && key == previous_key[grid_index]) {
+        cell_id = previous_id[grid_index];
+      } else {
+        cell_id = cell_maps[grid_index].GetCell(key);
+        previous_key[grid_index] = key;
+        previous_id[grid_index] = cell_id;
+        have_previous[grid_index] = true;
+      }
+      grid_cell_ids[grid_index][point_index] = cell_id;
+    }
+  }
+
+  // Size the per-cell histograms now that every cell is known, and take raw
+  // pointers to them: the parallel pass below only ever increments existing
+  // entries, so the arrays are never reallocated while it runs.
+  const size_t histogram_stride = tolerances_count + 1;
+  uint32_t* accurate_histogram_ptrs[kGridCount];
+  uint32_t* inaccurate_histogram_ptrs[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    AccuracyCellGrid& grid = cell_maps[grid_index];
+    grid.accurate_histogram.assign(grid.cell_count() * histogram_stride, 0);
+    grid.inaccurate_histogram.assign(grid.cell_count() * histogram_stride, 0);
+    accurate_histogram_ptrs[grid_index] = grid.accurate_histogram.data();
+    inaccurate_histogram_ptrs[grid_index] = grid.inaccurate_histogram.data();
+  }
+  const uint32_t* point_cell_ids_ptrs[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    point_cell_ids_ptrs[grid_index] =
+        point_cell_ids.data() +
+        static_cast<size_t>(grid_index) * reconstruction_size;
+  }
+
+  // Pass 2 (parallel): loop over the reconstruction points. Every iteration
+  // only reads the scan grids and writes integer tallies of its own cells plus
+  // its own entry of the per-point output, so the loop is free of ordering
+  // constraints.
+#pragma omp parallel for schedule(dynamic, 512)
+  for (long long int point_index = 0; point_index < reconstruction_size;
        ++point_index) {
     const pcl::PointXYZ& point = reconstruction.at(point_index);
-
-    // Find the voxels for this reconstruction point.
-    std::vector<AccuracyCell>* cell_vectors[kGridCount];
-    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-      std::vector<AccuracyCell>* cell_vector =
-          &cell_maps[grid_index][CalcCellCoordinates(
-              point, voxel_size_inv, kGridShifts[grid_index][0],
-              kGridShifts[grid_index][1], kGridShifts[grid_index][2])];
-      if (cell_vector->empty()) {
-        cell_vector->resize(tolerances_count);
-      }
-      cell_vectors[grid_index] = cell_vector;
-    }
 
     int aggregate_first_accurate_tolerance_index =
         static_cast<int>(sorted_tolerances_squared.size());
@@ -512,56 +899,90 @@ void ComputeAccuracy(
       }
     }
 
-    // Aggregate accurate count.
-    for (int tolerance_index = aggregate_first_accurate_tolerance_index;
-         tolerance_index < static_cast<int>(tolerances_count);
-         ++tolerance_index) {
-      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-        ++cell_vectors[grid_index]->at(tolerance_index).accurate_count;
-      }
-      if (output_point_results) {
-        point_is_accurate->at(tolerance_index)[point_index] =
-            AccuracyResult::kAccurate;
+    // Tally the classification into both voxel grids. The point is accurate
+    // for every tolerance index from aggregate_first_accurate_tolerance_index
+    // upwards, and inaccurate for every smaller one if inaccurate
+    // classifications exist; both are recorded as a single histogram bin and
+    // accumulated into counts below.
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      const size_t bin_offset =
+          static_cast<size_t>(point_cell_ids_ptrs[grid_index][point_index]) *
+              histogram_stride +
+          aggregate_first_accurate_tolerance_index;
+      uint32_t* accurate_bin = accurate_histogram_ptrs[grid_index] + bin_offset;
+#pragma omp atomic
+      ++(*accurate_bin);
+      if (aggregate_inaccurate_classifications_exist) {
+        uint32_t* inaccurate_bin =
+            inaccurate_histogram_ptrs[grid_index] + bin_offset;
+#pragma omp atomic
+        ++(*inaccurate_bin);
       }
     }
-    // Aggregate inaccurate count or unobserved count.
-    if (aggregate_inaccurate_classifications_exist) {
-      for (int tolerance_index = aggregate_first_accurate_tolerance_index - 1;
-           tolerance_index >= 0; --tolerance_index) {
-        for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-          ++cell_vectors[grid_index]->at(tolerance_index).inaccurate_count;
-        }
-        if (output_point_results) {
-          point_is_accurate->at(tolerance_index)[point_index] =
-              AccuracyResult::kInaccurate;
-        }
+
+    // Output point results, if requested. Entries below the first accurate
+    // tolerance index stay at their initial kUnobserved value unless
+    // inaccurate classifications exist.
+    if (output_point_results) {
+      for (int tolerance_index = aggregate_first_accurate_tolerance_index;
+           tolerance_index < static_cast<int>(tolerances_count);
+           ++tolerance_index) {
+        point_results[tolerance_index][point_index] = AccuracyResult::kAccurate;
       }
-    } else {
-      if (output_point_results) {
+      if (aggregate_inaccurate_classifications_exist) {
         for (int tolerance_index = aggregate_first_accurate_tolerance_index - 1;
              tolerance_index >= 0; --tolerance_index) {
-          point_is_accurate->at(tolerance_index)[point_index] =
-              AccuracyResult::kUnobserved;
+          point_results[tolerance_index][point_index] =
+              AccuracyResult::kInaccurate;
         }
       }
     }
   }
 
-  // Average results over all cells and fill the results vector.
+  // Average results over all cells and fill the results vector. The cells are
+  // walked in dense id order, which is the order in which the serial pass above
+  // first touched them, so the summation order is the original one.
   std::vector<double> accuracy_sum(tolerances_count, 0.0);
   std::vector<size_t> valid_cell_count(tolerances_count, 0);
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    for (auto it = cell_maps[grid_index].cbegin(),
-              end = cell_maps[grid_index].cend();
-         it != end; ++it) {
-      const std::vector<AccuracyCell>& cell_vector = it->second;
+    const AccuracyCellGrid& grid = cell_maps[grid_index];
+    const size_t grid_cell_count = grid.cell_count();
+    uint32_t* accurate_histogram = accurate_histogram_ptrs[grid_index];
+    uint32_t* inaccurate_histogram = inaccurate_histogram_ptrs[grid_index];
+
+    for (size_t cell_id = 0; cell_id < grid_cell_count; ++cell_id) {
+      // Turn this cell's histograms into the per-tolerance accurate and
+      // inaccurate counts, which is exactly what the original code counted:
+      // accurate_count[t]   = number of points with first_accurate <= t
+      // inaccurate_count[t] = number of points with inaccurate classifications
+      //                       and first_accurate > t
+      uint32_t* accurate_counts = accurate_histogram + cell_id * histogram_stride;
+      uint32_t running_sum = 0;
       for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
            ++tolerance_index) {
-        const AccuracyCell& cell = cell_vector[tolerance_index];
-        size_t valid_point_count = cell.accurate_count + cell.inaccurate_count;
+        running_sum += accurate_counts[tolerance_index];
+        accurate_counts[tolerance_index] = running_sum;
+      }
+
+      uint32_t* inaccurate_counts =
+          inaccurate_histogram + cell_id * histogram_stride;
+      running_sum = 0;
+      uint32_t carry = inaccurate_counts[tolerances_count];
+      for (int tolerance_index = static_cast<int>(tolerances_count) - 1;
+           tolerance_index >= 0; --tolerance_index) {
+        running_sum += carry;
+        carry = inaccurate_counts[tolerance_index];
+        inaccurate_counts[tolerance_index] = running_sum;
+      }
+
+      for (size_t tolerance_index = 0; tolerance_index < tolerances_count;
+           ++tolerance_index) {
+        const size_t accurate_count = accurate_counts[tolerance_index];
+        const size_t inaccurate_count = inaccurate_counts[tolerance_index];
+        size_t valid_point_count = accurate_count + inaccurate_count;
         if (valid_point_count > 0) {
           accuracy_sum[tolerance_index] +=
-              cell.accurate_count / (1.0f * valid_point_count);
+              accurate_count / (1.0f * valid_point_count);
           ++valid_cell_count[tolerance_index];
         }
       }
@@ -630,6 +1051,12 @@ void WriteAccuracyVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    pcl::io::savePLYFileBinary(file_path.str(), accuracy_visualization);
+    // The return value is deliberately dropped, because upstream drops it too:
+    // pcl::io::savePLYFileBinary() reported a write failure through PCL_ERROR,
+    // and main() sets the console verbosity to L_ALWAYS, which suppresses
+    // everything at L_ERROR and below. Reporting it here would put lines on
+    // stderr that the unmodified program does not emit -- for an empty cloud,
+    // which both writers refuse, on every tolerance.
+    fast_ply::WriteBinaryXyzRgbPly(file_path.str(), accuracy_visualization);
   }
 }

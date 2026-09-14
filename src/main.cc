@@ -29,10 +29,13 @@
 #include <Eigen/Core>
 #include <boost/filesystem.hpp>
 #include <pcl/console/parse.h>
+#ifdef MVE_PCL_IO_FALLBACK
 #include <pcl/io/ply_io.h>
+#endif
 
 #include "accuracy.h"
 #include "completeness.h"
+#include "fast_ply.h"
 #include "meshlab_project.h"
 #include "util.h"
 
@@ -42,11 +45,50 @@ const float kDegToRadFactor = M_PI / 180.0;
 // 0: Success.
 // 1: System failure (e.g., due to wrong parameters given).
 // 2: Reconstruction file input failure (PLY file cannot be found or read).
+// 3: A PLY input file is in a variant this build cannot read (see
+//    MVE_PCL_IO_FALLBACK in CMakeLists.txt). The file itself is fine; the
+//    build simply does not carry PCL's general PLY reader.
 enum class ReturnCodes {
   kSuccess = 0,
   kSystemFailure = 1,
-  kReconstructionFileInputFailure = 2
+  kReconstructionFileInputFailure = 2,
+  kUnsupportedPlyVariant = 3
 };
+
+// Loads one PLY point cloud through fast_ply, falling back to PCL's general
+// reader where the build provides it. Sets `*unsupported_variant` when the file
+// was readable but is not the layout fast_ply handles and there is no fallback
+// linked in -- that is the one failure a different build configuration would
+// have survived, so it gets its own return code rather than being reported as
+// an unreadable file.
+bool LoadPointCloudFile(const std::string& path, PointCloud* cloud,
+                        bool* unsupported_variant) {
+  *unsupported_variant = false;
+  fast_ply::LoadFailure failure = fast_ply::LoadFailure::kNone;
+  if (fast_ply::LoadBinaryXyzPly(path, cloud, &failure)) {
+    return true;
+  }
+#ifdef MVE_PCL_IO_FALLBACK
+  // PCL's general reader stays the reference implementation for every PLY that
+  // is not the one layout the fast path handles. It will also emit the usual
+  // PCL error messages if the file is genuinely unreadable.
+  return pcl::io::loadPLYFile(path, *cloud) >= 0;
+#else
+  *unsupported_variant = (failure == fast_ply::LoadFailure::kNotFastPathShape);
+  return false;
+#endif
+}
+
+// Printed next to the "cannot read" message when the only thing standing
+// between this build and the file is the reader that was configured out.
+const char kUnsupportedPlyVariantHint[] =
+    "The file is intact but is in a PLY variant this build cannot read: it is "
+    "not binary_little_endian, or its x/y/z are not float32, or its vertex "
+    "element has a list property, or it carries obj_info, camera or range_grid "
+    "data. This build does not link PCL's general PLY reader; it was "
+    "configured with MVE_PCL_IO_FALLBACK=OFF so that libpcl_io and the 47 VTK "
+    "libraries behind it are not loaded at startup. Reconfigure with "
+    "-DMVE_PCL_IO_FALLBACK=ON to read this file.";
 
 int main(int argc, char** argv) {
   pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
@@ -74,6 +116,13 @@ int main(int argc, char** argv) {
   std::string accuracy_cloud_output_path;
   pcl::console::parse_argument(argc, argv, "--accuracy_cloud_output_path",
                                accuracy_cloud_output_path);
+  // Which nearest neighbour index the completeness pass queries. "grid" is the
+  // uniform-voxel index and the default; "flann" is the original
+  // pcl::search::KdTree, kept reachable so that a host whose precompiled FLANN
+  // rounds differently can still reproduce the reference numbers.
+  std::string nn_index_name = "grid";
+  pcl::console::parse_argument(argc, argv, "--nn_index", nn_index_name);
+  const bool nn_verify = pcl::console::find_switch(argc, argv, "--nn_verify");
 
   // Validate arguments.
   std::stringstream errors;
@@ -92,6 +141,10 @@ int main(int argc, char** argv) {
   }
   if (voxel_size <= 0.f) {
     errors << "The voxel size must be positive." << std::endl;
+  }
+  if (nn_index_name != "grid" && nn_index_name != "flann") {
+    errors << "The --nn_index parameter must be either 'grid' or 'flann'."
+           << std::endl;
   }
 
   if (!errors.str().empty()) {
@@ -135,8 +188,17 @@ int main(int argc, char** argv) {
   std::cout << "Loading reconstruction: " << reconstruction_ply_path
             << std::endl;
   PointCloudPtr reconstruction(new PointCloud());
-  if (pcl::io::loadPLYFile(reconstruction_ply_path, *reconstruction) < 0) {
+  // fast_ply handles the binary_little_endian float x/y/z layouts -- bare, or
+  // with normals, colour and other per-point properties around them -- and
+  // produces a bit-identical cloud; the remaining variants need PCL's reader.
+  bool unsupported_variant = false;
+  if (!LoadPointCloudFile(reconstruction_ply_path, reconstruction.get(),
+                          &unsupported_variant)) {
     std::cerr << "Cannot read reconstruction file." << std::endl;
+    if (unsupported_variant) {
+      std::cerr << kUnsupportedPlyVariantHint << std::endl;
+      return static_cast<int>(ReturnCodes::kUnsupportedPlyVariant);
+    }
     return static_cast<int>(ReturnCodes::kReconstructionFileInputFailure);
   }
 
@@ -153,8 +215,13 @@ int main(int argc, char** argv) {
 
     std::cout << "Loading scan: " << file_path << std::endl;
     PointCloudPtr point_cloud(new PointCloud());
-    if (pcl::io::loadPLYFile(file_path, *point_cloud) < 0) {
+    if (!LoadPointCloudFile(file_path, point_cloud.get(),
+                            &unsupported_variant)) {
       std::cerr << "Cannot read scan file." << std::endl;
+      if (unsupported_variant) {
+        std::cerr << kUnsupportedPlyVariantHint << std::endl;
+        return static_cast<int>(ReturnCodes::kUnsupportedPlyVariant);
+      }
       return static_cast<int>(ReturnCodes::kSystemFailure);
     }
 
@@ -170,7 +237,10 @@ int main(int argc, char** argv) {
   std::vector<std::vector<bool>> point_is_complete;
   bool output_point_completeness = !completeness_cloud_output_path.empty();
   ComputeCompleteness(scan_infos, scans, reconstruction, voxel_size_inv,
-                      tolerances, &completeness_results,
+                      tolerances,
+                      (nn_index_name == "flann") ? NnIndexKind::kFlann
+                                                 : NnIndexKind::kGrid,
+                      nn_verify, &completeness_results,
                       output_point_completeness ? &point_is_complete : nullptr);
 
   // Write completeness visualization, if requested.
