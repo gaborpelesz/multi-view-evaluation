@@ -317,4 +317,194 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Writer.
+//
+// The layout below is not a guess: it was read back out of files produced by
+// pcl::io::savePLYFileBinary() on this exact PCL (1.15), both from this
+// program's own classification clouds and from a probe cloud carrying a
+// deliberately asymmetric sensor pose, a NaN, an infinity and a negative zero.
+// Every constant here is what that output contained.
+//
+//   ply
+//   format binary_little_endian 1.0
+//   comment PCL generated
+//   element vertex <width * height>
+//   property float x / y / z
+//   property uchar red / green / blue      <- PCL expands the packed "rgb"
+//   element face 0                            field into three uchars
+//   element camera 1
+//   property float view_px / view_py / view_pz
+//   property float x_axisx ... z_axisz
+//   property float focal / scalex / scaley / centerx / centery
+//   property int viewportx / viewporty
+//   property float k1 / k2
+//   end_header
+//
+// then width*height vertex records of 15 bytes (three little-endian float32
+// then three uchar), then nothing for the empty face element, then one 84-byte
+// camera record. The camera record holds the cloud's sensor pose: the origin,
+// the rotation matrix in ROW-MAJOR order (x_axis is row 0, verified with a
+// 90-degree rotation about Z, which is asymmetric enough to tell the two
+// conventions apart), five zero floats for the intrinsics PCL has no value for,
+// the cloud width and height as int32, and two zero floats for the distortion
+// coefficients.
+//
+// The vertex payload is a verbatim copy of the point's first three float32
+// words: PCL's writer memcpy's the field out of the PCLPointCloud2 blob and
+// writes it unchanged, so non-finite coordinates are preserved bit for bit and
+// are NOT filtered (confirmed on the probe cloud). That matters, because the
+// classification clouds inherit whatever the input PLY contained.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bytes per vertex on disk for the written layout (float x, y, z + uchar rgb).
+constexpr std::size_t kRgbDiskPointSize = 3 * sizeof(float) + 3;
+// Bytes in the trailing camera record: 17 float32, 2 int32, 2 float32.
+constexpr std::size_t kCameraRecordSize = 17 * 4 + 2 * 4 + 2 * 4;
+// Vertices staged per fwrite() call; 8192 records are 120 KiB.
+constexpr std::size_t kWriteChunkPoints = 8192;
+
+// Appends the little-endian representation of one 4-byte value. The host is
+// checked to be little-endian by the caller, so this is a plain copy.
+template <typename T>
+void AppendLe32(std::vector<char>* out, T value) {
+  static_assert(sizeof(T) == 4, "only 4-byte scalars are written here");
+  char bytes[4];
+  std::memcpy(bytes, &value, sizeof(bytes));
+  out->insert(out->end(), bytes, bytes + sizeof(bytes));
+}
+
+}  // namespace
+
+bool WriteBinaryXyzRgbPly(const std::string& path,
+                          const pcl::PointCloud<pcl::PointXYZRGB>& cloud) {
+  if (!HostIsLittleEndian()) {
+    return false;
+  }
+
+  // PCL counts the vertices as width * height, not as points.size(); the two
+  // agree for every cloud this program writes, but the file has to say what
+  // PCL's would say.
+  const std::uint64_t vertex_count =
+      static_cast<std::uint64_t>(cloud.width) * cloud.height;
+  if (vertex_count == 0 || vertex_count > cloud.points.size()) {
+    // pcl::PLYWriter::writeBinary() refuses an empty cloud with
+    // "Input point cloud has no data!" and creates no file at all; not
+    // creating one here keeps that behaviour. The second half of the test is a
+    // bounds guard, not a PCL behaviour: it cannot trigger for a cloud built by
+    // resize().
+    return false;
+  }
+
+  std::FILE* file = std::fopen(path.c_str(), "wb");
+  if (file == nullptr) {
+    return false;
+  }
+
+  // The header text is fixed apart from the vertex count.
+  std::string header =
+      "ply\n"
+      "format binary_little_endian 1.0\n"
+      "comment PCL generated\n"
+      "element vertex ";
+  header += std::to_string(vertex_count);
+  header +=
+      "\n"
+      "property float x\n"
+      "property float y\n"
+      "property float z\n"
+      "property uchar red\n"
+      "property uchar green\n"
+      "property uchar blue\n"
+      "element face 0\n"
+      "element camera 1\n"
+      "property float view_px\n"
+      "property float view_py\n"
+      "property float view_pz\n"
+      "property float x_axisx\n"
+      "property float x_axisy\n"
+      "property float x_axisz\n"
+      "property float y_axisx\n"
+      "property float y_axisy\n"
+      "property float y_axisz\n"
+      "property float z_axisx\n"
+      "property float z_axisy\n"
+      "property float z_axisz\n"
+      "property float focal\n"
+      "property float scalex\n"
+      "property float scaley\n"
+      "property float centerx\n"
+      "property float centery\n"
+      "property int viewportx\n"
+      "property int viewporty\n"
+      "property float k1\n"
+      "property float k2\n"
+      "end_header\n";
+  if (std::fwrite(header.data(), 1, header.size(), file) != header.size()) {
+    std::fclose(file);
+    return false;
+  }
+
+  std::vector<char> staging(kWriteChunkPoints * kRgbDiskPointSize);
+  const pcl::PointXYZRGB* source = cloud.points.data();
+  std::uint64_t remaining = vertex_count;
+  while (remaining > 0) {
+    const std::size_t chunk = static_cast<std::size_t>(
+        remaining < kWriteChunkPoints ? remaining : kWriteChunkPoints);
+    char* dest = staging.data();
+    for (std::size_t i = 0; i < chunk; ++i, ++source, dest += kRgbDiskPointSize) {
+      // Verbatim copy of the three float32 coordinate words, exactly as PCL
+      // does it: no rounding, no finiteness test, no reordering.
+      std::memcpy(dest, source->data, 3 * sizeof(float));
+      // PCL unpacks the "rgb" field into three uchars in the order the header
+      // declares them. PointXYZRGB stores the channels as b, g, r, a in
+      // memory, so naming the members rather than copying bytes is what keeps
+      // the order right.
+      dest[12] = static_cast<char>(source->r);
+      dest[13] = static_cast<char>(source->g);
+      dest[14] = static_cast<char>(source->b);
+    }
+    const std::size_t bytes = chunk * kRgbDiskPointSize;
+    if (std::fwrite(staging.data(), 1, bytes, file) != bytes) {
+      std::fclose(file);
+      return false;
+    }
+    remaining -= chunk;
+  }
+
+  // The "face" element is declared with a count of zero, so nothing follows it.
+  // The "camera" element is one record describing the cloud's sensor pose.
+  const Eigen::Matrix3f rotation = cloud.sensor_orientation_.toRotationMatrix();
+  std::vector<char> camera;
+  camera.reserve(kCameraRecordSize);
+  for (int i = 0; i < 3; ++i) {
+    AppendLe32(&camera, cloud.sensor_origin_[i]);
+  }
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      AppendLe32(&camera, rotation(row, column));
+    }
+  }
+  // focal, scalex, scaley, centerx, centery: PCL has no camera intrinsics to
+  // put here and writes five zeros.
+  for (int i = 0; i < 5; ++i) {
+    AppendLe32(&camera, 0.0f);
+  }
+  AppendLe32(&camera, static_cast<std::int32_t>(cloud.width));
+  AppendLe32(&camera, static_cast<std::int32_t>(cloud.height));
+  // k1, k2: the distortion coefficients, likewise always zero.
+  AppendLe32(&camera, 0.0f);
+  AppendLe32(&camera, 0.0f);
+  if (camera.size() != kCameraRecordSize ||
+      std::fwrite(camera.data(), 1, camera.size(), file) != camera.size()) {
+    std::fclose(file);
+    return false;
+  }
+
+  // A write error can still surface here, when the last buffer is flushed.
+  return std::fclose(file) == 0;
+}
+
 }  // namespace fast_ply

@@ -27,14 +27,17 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstdint>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 #include "completeness.h"
 
 #include <pcl/common/transforms.h>
-#include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
+
+#include "fast_ply.h"
 
 const int kGridCount = 2;
 const float kGridShifts[kGridCount][3] = {{0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}};
@@ -427,6 +430,10 @@ void WriteCompletenessVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    pcl::io::savePLYFileBinary(file_path.str(), completeness_visualization);
+    if (!fast_ply::WriteBinaryXyzRgbPly(file_path.str(),
+                                        completeness_visualization)) {
+      std::cerr << "Cannot write completeness visualization to "
+                << file_path.str() << std::endl;
+    }
   }
 }
