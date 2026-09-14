@@ -312,12 +312,16 @@ class Band0VoxelFilter {
   // accept_squared_ from (qx, qy, qz). A false answer means "not established",
   // never "there is none": the caller must then run the kd-tree query. Every
   // early exit below -- the filter being disabled, a non-finite or far-away
-  // query, a cell block that misses the point that would have qualified -- is
-  // therefore safe by construction.
+  // query, a cell block that misses the point that would have qualified, a
+  // block too crowded to be worth scanning -- is therefore safe by
+  // construction.
   inline bool HasPointWithin(float qx, float qy, float qz) const {
     if (!enabled_) {
       return false;
     }
+    // Candidates this query may test before it gives up. See
+    // kMaxQueryCandidates.
+    uint32_t budget = kMaxQueryCandidates;
     // Rejects non-finite and absurdly distant queries in one comparison: any
     // NaN or infinity makes the sum non-finite and the test false. Everything
     // that passes has |coordinate| < 1e12, so multiplying by the reciprocal
@@ -342,7 +346,7 @@ class Band0VoxelFilter {
     // The cell the query sits in holds the qualifying point for most queries,
     // so it is probed on its own before the surrounding block is considered.
     const uint32_t home_cell = CellIndex(home_x, home_y, home_z);
-    if (ScanCell(home_cell, qx, qy, qz)) {
+    if (ScanCell(home_cell, qx, qy, qz, &budget)) {
       return true;
     }
     for (int z = lo_z; z <= hi_z; ++z) {
@@ -352,7 +356,7 @@ class Band0VoxelFilter {
           if (cell == home_cell) {
             continue;
           }
-          if (ScanCell(cell, qx, qy, qz)) {
+          if (ScanCell(cell, qx, qy, qz, &budget)) {
             return true;
           }
         }
@@ -372,6 +376,22 @@ class Band0VoxelFilter {
   // for the difference of two in-range indices (below 2^62) and for the
   // subtraction of an in-range origin from an in-range index.
   static constexpr double kMaxCellIndex = 0x1p61;
+  // Points one query may test across its whole 2x2x2 block before declining.
+  //
+  // The cell budget above is a cap on cell COUNT, not on density: a cloud whose
+  // extent forces the grid to be coarsened -- a single gross outlier a hundred
+  // kilometres out is enough, and ETH3D reconstructions do contain those --
+  // ends up with cells holding thousands of points each, and scanning one of
+  // those linearly is far slower than the kd-tree descent it replaces. Measured
+  // on the bench reconstruction with one point moved to (1e5, 0, 0), which
+  // coarsens the grid from 1/16 m to 1 m (max occupancy 466 -> 54679): at 12
+  // threads the parallel query pass takes 0.464 s with no budget against
+  // 0.246 s for the unfiltered original, a 1.9x regression, and 0.261 s with
+  // this budget. 2048 is above the largest whole-block candidate count the
+  // bench scene produces -- its accepted-query count is identical, 2637093 of
+  // 3172208, with the budget and without it -- so a healthy grid never reaches
+  // it.
+  static const uint32_t kMaxQueryCandidates = 2048u;
 
   static inline bool IsUsable(float x, float y, float z) {
     return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
@@ -474,9 +494,21 @@ class Band0VoxelFilter {
   // rounded float multiplications, and the sum is accumulated left to right
   // just as L2_Simple's loop accumulates it. Only FMA contraction can make this
   // differ from FLANN's value at all, and accept_squared_ leaves room for it.
-  inline bool ScanCell(uint32_t cell, float qx, float qy, float qz) const {
+  inline bool ScanCell(uint32_t cell, float qx, float qy, float qz,
+                       uint32_t* budget) const {
     const uint32_t begin = cell_start_[cell];
     const uint32_t end = cell_start_[cell + 1];
+    // Out of budget: abandon this query rather than pay more for it than the
+    // kd-tree descent it exists to avoid. Zeroing the budget rather than
+    // scanning a prefix keeps the outcome independent of the order the points
+    // were scattered into the cell, which the atomic scatter in Build() does
+    // not fix. Like every other early exit here, giving up is safe: it can only
+    // make the filter decline, and a decline runs the original code.
+    if (end - begin > *budget) {
+      *budget = 0;
+      return false;
+    }
+    *budget -= end - begin;
     const float* point = points_.data() + static_cast<size_t>(begin) * 4;
     for (uint32_t i = begin; i < end; ++i, point += 4) {
       const float dx = qx - point[0];
