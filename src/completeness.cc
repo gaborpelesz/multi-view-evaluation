@@ -168,8 +168,15 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // the outer test is a strict 'knn_squared_dists[0] < maximum_tolerance_
   // squared', which an all-zero tolerance list would fail even for a point
   // lying exactly on a reconstruction point.
+  //
+  // MVE_BAND0_DISABLE=1 leaves the filter unbuilt and every scan point on the
+  // original path. Nothing in a measurement campaign should need it, but it is
+  // what makes the filter's own contribution re-derivable from the shipped
+  // binary rather than only from a deleted scratch build, and it is the fallback
+  // if the filter ever has to be taken out of the loop on a new host.
   Band0VoxelFilter band0_filter;
-  if (sorted_tolerances.front() > 0.f && maximum_tolerance_squared > 0.f) {
+  if (sorted_tolerances.front() > 0.f && maximum_tolerance_squared > 0.f &&
+      std::getenv("MVE_BAND0_DISABLE") == nullptr) {
     band0_filter.Build(*reconstruction, sorted_tolerances.front(),
                        sorted_tolerances_squared.front());
   }
