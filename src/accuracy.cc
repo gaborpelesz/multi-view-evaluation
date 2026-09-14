@@ -602,12 +602,15 @@ void ComputeAccuracy(
   // Size both cell tables before anything is inserted. Left to grow from its
   // 1024-slot default, each table doubles its way up to millions of slots and
   // re-probes every cell it holds at every doubling, which costs more random
-  // probes than answering the lookups does.
+  // probes than answering the lookups does. The estimate is a sample of the
+  // cell space rather than of the points, so it tracks the number of cells at
+  // any density and each table ends up the size it would have grown to anyway.
+  size_t expected_cells[kGridCount];
+  EstimateDistinctCellCounts(reconstruction.points.data(),
+                             static_cast<size_t>(reconstruction_size),
+                             voxel_size_inv, kGridShifts, expected_cells);
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    cell_maps[grid_index].Reserve(EstimateDistinctCellCount(
-        reconstruction.points.data(), static_cast<size_t>(reconstruction_size),
-        voxel_size_inv, kGridShifts[grid_index][0], kGridShifts[grid_index][1],
-        kGridShifts[grid_index][2]));
+    cell_maps[grid_index].Reserve(expected_cells[grid_index]);
   }
   // Both grids are walked together, one point at a time. kGridCount is a
   // compile-time 2, so the grid loop unrolls and the point array is streamed
