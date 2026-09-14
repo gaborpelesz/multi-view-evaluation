@@ -34,6 +34,10 @@
 #include <Eigen/StdVector>
 #include <pcl/io/ply_io.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 // Number of cells used for the spatial access structure in inclination and
 // azimuth directions.
 const int kCellCountInclination = 1024;
@@ -505,6 +509,89 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
   }
 }
 
+// Scratch bytes SphericalPointGrid::Build holds per scan point for the whole
+// call: the converted-but-not-yet-binned points plus their cell indices.
+const size_t kGridBuildScratchBytesPerPoint =
+    sizeof(GridScanPoint) + sizeof(uint32_t);
+
+// Scratch always allowed in flight, whatever the scene. Small scenes -- the
+// benchmark datasets among them -- must never be throttled by the cap, and half
+// a gibibyte is both far above anything they reach and a bounded amount to add
+// to a host that is not memory constrained.
+const size_t kGridBuildScratchFloorBytes = static_cast<size_t>(512) << 20;
+
+// How many of the per-scan spherical grids ComputeAccuracy may build at once.
+//
+// Build's scratch is freed when it returns, but it is live for the whole call,
+// so building S scans on P threads holds P copies of it at once -- and holds
+// them at the same time as every grid already finished, which is the working
+// set this phase cannot avoid. Uncapped, that is a memory multiplier the serial
+// loop never had: on a scene with 5M-point scans a 12-thread host would add
+// 12 * 5M * 32 B = ~1.9 GB of transient scratch to a ~4.5 GB grid working set,
+// purely as a consequence of parallelising the loop. An out-of-memory kill
+// there is recorded by the benchmark harness as a failure of the method under
+// test, not as a cost of this optimization, so the multiplier has to be bounded
+// rather than merely documented.
+//
+// Bound the scratch, not the thread count: allow at most a quarter of the
+// memory the grids themselves will occupy once built, and never less than the
+// floor above. Expressing the cap relative to the phase's own unavoidable
+// footprint is what keeps it useful at both ends -- it never binds on the
+// benchmark scenes (3 scans of ~1.06M points need ~102 MB of scratch against a
+// 512 MB floor), and on the 30-scan campaign scene above it admits 6 threads
+// instead of 12, halving the added peak while keeping most of the speedup.
+//
+// The result is a function of the input alone -- the scan sizes, the scan count
+// and the OpenMP thread limit -- and never of the host's free memory, so the
+// thread count a given run uses is reproducible, which a measurement tool
+// requires. It cannot change what is computed either: the loop iterations are
+// independent, so the number of threads that run them is not observable in the
+// output.
+static int GridBuildThreadCount(const std::vector<PointCloudPtr>& scans) {
+  int max_threads = 1;
+#ifdef _OPENMP
+  max_threads = omp_get_max_threads();
+#endif
+  const size_t scan_count = scans.size();
+  // num_threads() requires a positive argument, so never return zero -- which
+  // is also what an empty scan list has to yield.
+  const size_t thread_count =
+      std::min(static_cast<size_t>(std::max(1, max_threads)), scan_count);
+  if (thread_count <= 1) {
+    return 1;
+  }
+
+  size_t total_points = 0;
+  size_t max_points = 0;
+  for (const PointCloudPtr& scan : scans) {
+    const size_t scan_points = scan->size();
+    total_points += scan_points;
+    max_points = std::max(max_points, scan_points);
+  }
+  if (max_points == 0) {
+    return 1;
+  }
+
+  // What the grids weigh after the loop: the points in CSR order, plus one
+  // dense offsets array per scan.
+  const size_t offsets_bytes =
+      (static_cast<size_t>(kCellCountAzimuth) * kCellCountInclination + 1) *
+      sizeof(uint32_t);
+  const size_t grid_bytes = total_points * sizeof(GridScanPoint) +
+                            scan_count * offsets_bytes;
+
+  const size_t scratch_budget =
+      std::max(kGridBuildScratchFloorBytes, grid_bytes / 4);
+  // The largest scan sets the per-thread cost, because dynamic scheduling may
+  // hand it to any thread at any time.
+  const size_t scratch_per_thread =
+      max_points * kGridBuildScratchBytesPerPoint;
+  const size_t affordable_threads =
+      std::max<size_t>(1, scratch_budget / scratch_per_thread);
+
+  return static_cast<int>(std::min(thread_count, affordable_threads));
+}
+
 void ComputeAccuracy(
     const MeshLabMeshInfoVector& scan_infos,
     const std::vector<PointCloudPtr>& scans, const PointCloud& reconstruction,
@@ -559,10 +646,15 @@ void ComputeAccuracy(
   // assignments below never reallocate it and never race. dynamic,1 because
   // scans differ in point count and the loop trip count is small (a handful of
   // scans on the benchmark dataset, twenty to forty on a real ETH3D scene).
+  //
+  // The team size is capped so that the scratch Build holds while it runs stays
+  // bounded however many threads and however large the scans are; see
+  // GridBuildThreadCount. On the benchmark scenes the cap does not bind.
   std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
   const long long int signed_scan_count =
       static_cast<long long int>(scan_count);
-#pragma omp parallel for schedule(dynamic, 1)
+  const int grid_build_threads = GridBuildThreadCount(scans);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(grid_build_threads)
   for (long long int scan_index = 0; scan_index < signed_scan_count;
        ++scan_index) {
     point_grids[scan_index].reset(
