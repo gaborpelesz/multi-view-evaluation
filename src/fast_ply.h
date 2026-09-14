@@ -55,4 +55,16 @@ namespace fast_ply {
 // messages if the file is genuinely unreadable).
 bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud);
 
+// Writes `cloud` to `path` as a binary_little_endian PLY, producing byte for
+// byte the same file that pcl::io::savePLYFileBinary() produces for a
+// pcl::PointCloud<pcl::PointXYZRGB>.
+//
+// This exists only so that the evaluation binary does not have to link
+// libpcl_io. See the implementation for the layout this reproduces and for how
+// each part of it was pinned down against PCL's own output. Returns false if
+// the file could not be created or not written in full; as in PCL, a cloud with
+// no points is refused and no file is created.
+bool WriteBinaryXyzRgbPly(const std::string& path,
+                          const pcl::PointCloud<pcl::PointXYZRGB>& cloud);
+
 }  // namespace fast_ply

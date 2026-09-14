@@ -32,18 +32,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "completeness.h"
 
 #include <pcl/common/transforms.h>
-#include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
 
 #include "band0_filter.h"
+#include "fast_ply.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1188,6 +1190,10 @@ void WriteCompletenessVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    pcl::io::savePLYFileBinary(file_path.str(), completeness_visualization);
+    if (!fast_ply::WriteBinaryXyzRgbPly(file_path.str(),
+                                        completeness_visualization)) {
+      std::cerr << "Cannot write completeness visualization to "
+                << file_path.str() << std::endl;
+    }
   }
 }
