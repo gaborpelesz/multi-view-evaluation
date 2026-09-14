@@ -346,6 +346,26 @@ class ReconstructionNearestIndex {
   // run identical in shape to the original.
   void Build(const PointCloudPtr& cloud, int requested_partitions);
 
+  // The same build, but expressed as work for a team the caller has already
+  // opened: it must be called from inside an `omp single` (or an explicit
+  // task), and it distributes its own parallelism with tasks rather than by
+  // opening parallel regions of its own.
+  //
+  // This exists so that the build can run CONCURRENTLY WITH another serial
+  // block of the caller's -- the completeness cell assignment -- on one team.
+  // Build() cannot: a parallel region nested inside the caller's would be
+  // serialised wherever OMP_MAX_ACTIVE_LEVELS is 1, which is how the benchmark
+  // harness runs, and the partitioned build would silently collapse back onto
+  // one thread. Build() is now a thin wrapper that opens a team and calls this.
+  //
+  // Nothing about WHAT is built changes. The partition split is a function of
+  // the point set alone and was already argued to be independent of how OpenMP
+  // schedules its tasks; the per-partition box, index list and FLANN tree are
+  // computed from disjoint ranges and touch no shared state, so turning the two
+  // `omp parallel for` loops into one task per partition changes only which
+  // thread runs which partition -- which no output depends on.
+  void BuildInTeam(const PointCloudPtr& cloud, int requested_partitions);
+
   // Builds (or rebuilds as) the single index over the whole cloud, which is the
   // original code path. Rebuilding is what the caller does when the probe finds
   // that box pruning has collapsed on this scene.
@@ -445,6 +465,18 @@ class ReconstructionNearestIndex {
 
 void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
                                        int requested_partitions) {
+  // Open the team here so that BuildInTeam always runs with one generating
+  // thread and a pool to hand its tasks to, exactly as it does when the caller
+  // supplies the team. At one thread this is a one-thread team and every task
+  // below is executed by the thread that created it, which is the original
+  // serial order.
+#pragma omp parallel
+#pragma omp single
+  BuildInTeam(cloud, requested_partitions);
+}
+
+void ReconstructionNearestIndex::BuildInTeam(const PointCloudPtr& cloud,
+                                             int requested_partitions) {
   if (requested_partitions > 1 &&
       cloud->size() >= 2 * kMinPartitionPoints) {
     // Collect the points FLANN would actually index. KdTreeFLANN drops
@@ -477,8 +509,8 @@ void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
 
     if (partition_count > 1) {
       std::vector<std::pair<size_t, size_t>> ranges(partition_count);
-#pragma omp parallel
-#pragma omp single
+      // Called directly: SplitPartitions spawns its own tasks and waits for
+      // them, and we are already the single generating thread of a team.
       SplitPartitions(points.data(), 0, points.size(), partition_count, 0,
                       ranges.data());
 
@@ -487,8 +519,9 @@ void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
       // parallel loop over partitions.
       partition_indices_.resize(partition_count);
       boxes_.resize(partition_count);
-#pragma omp parallel for schedule(dynamic, 1)
       for (int i = 0; i < partition_count; ++i) {
+#pragma omp task firstprivate(i)
+        {
         const size_t begin = ranges[i].first;
         const size_t end = ranges[i].second;
         pcl::IndicesPtr indices(new pcl::Indices(end - begin));
@@ -509,7 +542,14 @@ void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
           }
         }
         partition_indices_[i] = indices;
+        }
       }
+      // `points` and `ranges` are read by the tasks above and `points` is freed
+      // right below, so the tasks have to have finished by here. taskwait waits
+      // for the children of THIS task only -- a sibling task the caller may be
+      // running concurrently (the cell assignment) is not a child and is not
+      // waited for.
+#pragma omp taskwait
 
       // Release the packed copy before the trees allocate their own coordinate
       // arrays: what matters is the peak footprint, not the total.
@@ -526,12 +566,13 @@ void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
       // The point of the whole class: FLANN's own buildIndex is serial, but P
       // independent indices are P independent builds. Each KdTreeFLANN owns its
       // FLANN index, its allocator and its parameter map and touches no shared
-      // state. Dynamic scheduling because the partitions are equal in point
-      // count but not necessarily in build cost.
-#pragma omp parallel for schedule(dynamic, 1)
+      // state. One task per partition rather than a static split, because the
+      // partitions are equal in point count but not necessarily in build cost.
       for (int i = 0; i < partition_count; ++i) {
+#pragma omp task firstprivate(i)
         trees_[i]->setInputCloud(cloud, partition_indices_[i]);
       }
+#pragma omp taskwait
       return;
     }
   }
@@ -814,6 +855,15 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     reconstruction_nn_index.Build(reconstruction, requested_partitions);
   };
 
+  // The same build, handed to the team the overlap below has already opened
+  // instead of opening one of its own. See ReconstructionNearestIndex::
+  // BuildInTeam for why the distinction matters and why it changes no value.
+  auto BuildReconstructionIndexInTeam = [&reconstruction_nn_index,
+                                         &reconstruction,
+                                         requested_partitions]() {
+    reconstruction_nn_index.BuildInTeam(reconstruction, requested_partitions);
+  };
+
   auto AssignCells = [&cell_maps, &point_cell_ids, &histogram_ptrs, &scan,
                       voxel_size_inv, scan_point_size, tolerances_count]() {
     // Hoist the loop invariants out of the closure before the hot loop. A
@@ -918,18 +968,11 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   };
 
   // Run the two preparation blocks concurrently when the runtime has more than
-  // one thread to offer and the index build is itself a single serial block.
-  // Both were strictly serial internally and used to run back to back, so their
-  // costs added up while every other core idled: with a single FLANN index the
-  // build is ~0.54 s on the bench dataset and the cell assignment ~0.10 s, and
-  // that pair was the largest serial stretch of the run. Overlapped, it costs
-  // the maximum of the two instead of their sum.
-  //
-  // The team is capped at two threads because there are exactly two blocks to
-  // run. A wider team would park the surplus threads in the sections barrier
-  // for the whole build, which is free under OMP_WAIT_POLICY=PASSIVE but would
-  // burn ten cores' worth of CPU under ACTIVE -- and the harness asserts an
-  // upper bound on the run's cpu/wall ratio.
+  // one thread to offer. They used to run back to back, so their costs added up
+  // while cores idled. On the bench dataset at twelve threads the cell
+  // assignment is ~0.097 s and is irreducibly serial; the index build is ~0.54 s
+  // as a single FLANN tree and ~0.085 s as twelve sub-trees. Either way the
+  // pair now costs about the larger of the two rather than their sum.
   //
   // Below two threads no parallel region is entered at all and the blocks run
   // back to back in the original order. That is deliberate: the single-thread
@@ -945,27 +988,42 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // same input, which is both the measurement the deviation policy asks for and
   // the strongest differential correctness test available for it.
   //
-  // WHY THE INDEX SHAPE IS PART OF THE CONDITION. This overlap was written
-  // against a single pcl::search::KdTree, whose build contains no OpenMP at all
-  // and is therefore exactly the serial block a sections team can hide. With
-  // --nn_index partitioned the build is itself a parallel region over P
-  // sub-trees, and the benchmark harness runs with OMP_MAX_ACTIVE_LEVELS=1: a
-  // parallel region nested inside this sections team collapses to a single
-  // thread. Overlapping there would trade a build that costs 0.085 s on twelve
-  // threads for one that costs 0.54 s on one thread, in order to save the
-  // 0.097 s of cell assignment -- it would not merely fail to pay, it would
-  // silently switch the partitioned build off. Hiding the cell assignment
-  // behind a *parallel* build would need that build to join the caller's team
-  // rather than open a team of its own; until it does, the partitioned arm runs
-  // the two blocks back to back and --serial_prepare is a no-op on it.
-  const bool index_build_is_serial = requested_partitions <= 1;
-  if (!serial_prepare && index_build_is_serial && omp_get_max_threads() > 1) {
-#pragma omp parallel sections num_threads(2)
+  // WHY THIS IS TASKS AND NOT SECTIONS. The overlap was written against a
+  // single pcl::search::KdTree, whose build contains no OpenMP at all: two
+  // sections on a two-thread team were exactly the right shape for two serial
+  // blocks. With --nn_index partitioned the build is itself parallel over P
+  // sub-trees, and the harness runs with OMP_MAX_ACTIVE_LEVELS=1, so a parallel
+  // region nested inside a sections team collapses to one thread. Keeping the
+  // sections there would have traded a build that costs 0.085 s on twelve
+  // threads for one that costs 0.54 s on one thread in order to save the
+  // 0.097 s of cell assignment -- it would not merely have failed to pay, it
+  // would have switched the partitioned build off while still passing every
+  // correctness gate.
+  //
+  // So the team is opened once, here, and both blocks are given to it as
+  // tasks. The cell assignment is one task and is serial from end to end, as it
+  // must be: it is what fixes the first-touch order of the cell ids. The index
+  // build is another task which spawns one further task per partition, so the
+  // remaining threads build sub-trees while the assignment runs. A `taskwait`
+  // inside one task waits only for that task's own children, which is what lets
+  // the build synchronise internally without waiting for the assignment.
+  //
+  // The team is sized to the work there is: one thread for the cell assignment
+  // plus one per sub-tree, never more than the runtime offers. With a single
+  // index that is the original two. Surplus threads would park in the barrier,
+  // which is free under OMP_WAIT_POLICY=PASSIVE but burns cores under ACTIVE,
+  // and the harness asserts an upper bound on the run's cpu/wall ratio.
+  const int prepare_threads =
+      std::min(omp_get_max_threads(), std::max(2, requested_partitions + 1));
+  if (!serial_prepare && omp_get_max_threads() > 1) {
+#pragma omp parallel num_threads(prepare_threads)
+#pragma omp single
     {
-#pragma omp section
-      BuildReconstructionIndex();
-#pragma omp section
+#pragma omp task
       AssignCells();
+#pragma omp task
+      BuildReconstructionIndexInTeam();
+#pragma omp taskwait
     }
   } else {
     BuildReconstructionIndex();
