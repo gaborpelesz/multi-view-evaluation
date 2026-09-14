@@ -229,8 +229,9 @@ class SphericalPointGrid {
   // cell's running cursor, so it is stable: within a cell, the points end up in
   // increasing point index order, which is exactly the order the previous
   // push_back-based construction produced. The order in which ClassifyPoint
-  // visits a cell's points is therefore unchanged. Only the conversion runs in
-  // parallel; the binning stays serial and in point order.
+  // visits a cell's points is therefore unchanged. Every pass here is serial
+  // and in point order; the parallelism is one level up, across scans (see
+  // ComputeAccuracy), so a Build call is a single thread's unit of work.
   void Build(const PointCloud& cartesian_cloud) {
     const size_t point_count = cartesian_cloud.size();
     const size_t cell_count = cell_offsets_.size() - 1;
@@ -241,15 +242,20 @@ class SphericalPointGrid {
 
     std::fill(cell_offsets_.begin(), cell_offsets_.end(), 0u);
 
-    // Pass 1 (parallel): spherical conversion and cell index computation. The
-    // conversion and the cell index computation are the unchanged original
-    // code, so every point lands in the same cell with the same field values as
-    // before. Each iteration writes only its own element of the two scratch
-    // arrays and reduces nothing, so the result does not depend on the thread
-    // schedule.
+    // Pass 1: spherical conversion and cell index computation. The conversion
+    // and the cell index computation are the unchanged original code, so every
+    // point lands in the same cell with the same field values as before.
+    //
+    // This loop used to carry its own `omp parallel for`. It no longer does,
+    // because the caller now runs whole Build calls in parallel: an inner
+    // region would be nested inside that one, and the benchmark harness sets
+    // OMP_MAX_ACTIVE_LEVELS=1, so the inner team would collapse to a single
+    // thread anyway while still paying a fork/join per scan. Splitting the
+    // work by scan keeps every thread on one scan's private data, which is
+    // also friendlier to the caches than twelve threads sharing one scan's
+    // 8 MiB offsets array.
     const long long int signed_point_count =
         static_cast<long long int>(point_count);
-#pragma omp parallel for schedule(static)
     for (long long int p = 0; p < signed_point_count; ++p) {
       const SphericalPointAndDirection spherical_point(
           cartesian_cloud.at(p).getVector3fMap());
@@ -536,8 +542,20 @@ void ComputeAccuracy(
   // Transform all scan points to spherical coordinates, and sort them into grid
   // cells defined on the spherical coordinates. The grid owns the points, so no
   // separate spherical point cloud is kept alongside it.
+  //
+  // One scan per thread. Each iteration constructs and fills point_grids[i]
+  // from scans[i] and from nothing else: the grids are independent objects, no
+  // scan's Build reads or writes another scan's grid, and nothing is reduced
+  // across scans here. The vector is sized before the loop, so the element
+  // assignments below never reallocate it and never race. dynamic,1 because
+  // scans differ in point count and the loop trip count is small (a handful of
+  // scans on the benchmark dataset, twenty to forty on a real ETH3D scene).
   std::vector<std::shared_ptr<SphericalPointGrid>> point_grids(scan_count);
-  for (size_t scan_index = 0; scan_index < scan_count; ++scan_index) {
+  const long long int signed_scan_count =
+      static_cast<long long int>(scan_count);
+#pragma omp parallel for schedule(dynamic, 1)
+  for (long long int scan_index = 0; scan_index < signed_scan_count;
+       ++scan_index) {
     point_grids[scan_index].reset(
         new SphericalPointGrid(kCellCountAzimuth, kCellCountInclination));
     point_grids[scan_index]->Build(*scans[scan_index]);
