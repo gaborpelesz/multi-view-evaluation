@@ -82,11 +82,13 @@ bool LoadPointCloudFile(const std::string& path, PointCloud* cloud,
 // Printed next to the "cannot read" message when the only thing standing
 // between this build and the file is the reader that was configured out.
 const char kUnsupportedPlyVariantHint[] =
-    "The file is not a plain binary_little_endian PLY with a single vertex "
-    "element carrying float x, y, z, and this build does not link PCL's "
-    "general PLY reader: it was configured with MVE_PCL_IO_FALLBACK=OFF so "
-    "that libpcl_io and the 47 VTK libraries behind it are not loaded at "
-    "startup. Reconfigure with -DMVE_PCL_IO_FALLBACK=ON to read this file.";
+    "The file is intact but is in a PLY variant this build cannot read: it is "
+    "not binary_little_endian, or its x/y/z are not float32, or its vertex "
+    "element has a list property, or it carries obj_info, camera or range_grid "
+    "data. This build does not link PCL's general PLY reader; it was "
+    "configured with MVE_PCL_IO_FALLBACK=OFF so that libpcl_io and the 47 VTK "
+    "libraries behind it are not loaded at startup. Reconfigure with "
+    "-DMVE_PCL_IO_FALLBACK=ON to read this file.";
 
 int main(int argc, char** argv) {
   pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
@@ -199,8 +201,9 @@ int main(int argc, char** argv) {
   std::cout << "Loading reconstruction: " << reconstruction_ply_path
             << std::endl;
   PointCloudPtr reconstruction(new PointCloud());
-  // The fast path handles plain binary_little_endian float x/y/z files and
-  // produces a bit-identical cloud; everything else needs PCL's reader.
+  // fast_ply handles the binary_little_endian float x/y/z layouts -- bare, or
+  // with normals, colour and other per-point properties around them -- and
+  // produces a bit-identical cloud; the remaining variants need PCL's reader.
   bool unsupported_variant = false;
   if (!LoadPointCloudFile(reconstruction_ply_path, reconstruction.get(),
                           &unsupported_variant)) {
