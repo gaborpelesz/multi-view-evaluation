@@ -32,19 +32,27 @@
 
 #include "util.h"
 
-// Fast reader for the single common case in the ETH3D evaluation: a PLY file
-// that is binary_little_endian and contains exactly one element, "vertex",
-// whose only properties are float x, float y, float z, in that order.
+// Fast reader for the binary PLY files the ETH3D evaluation is given: a
+// binary_little_endian file whose "vertex" element has a fixed-width record and
+// stores x, y and z as float32.
 //
-// This is a pure I/O optimization. For a file of that shape the on-disk bytes
-// are already IEEE-754 float32 in the same order as pcl::PointXYZ's first three
-// members, so the points are copied verbatim and the resulting cloud is
-// bit-identical to the one pcl::io::loadPLYFile() produces. Every file that
-// does not provably have that exact shape (extra properties such as colour,
-// normals or intensity, additional elements such as "face", "camera" or
-// "range_grid", ASCII or big-endian encoding, a truncated or over-long data
-// block) is rejected here so that the caller falls back to PCL's general
-// reader, which stays the reference implementation for all other inputs.
+// This is a pure I/O optimization, and it is also the only PLY reader this
+// build carries when MVE_PCL_IO_FALLBACK is OFF, so what it accepts has to be
+// what the evaluation is actually fed: plain x/y/z, x/y/z with normals, with
+// colour, with per-point scalars, in any property order, with or without
+// further elements after the vertex block. The coordinate words are copied
+// verbatim -- on disk they are already IEEE-754 float32 in the order of
+// pcl::PointXYZ's first three members -- so for every file it accepts the
+// resulting cloud is bit-identical to the one pcl::io::loadPLYFile() produces,
+// down to width, height, is_dense and the sensor pose.
+//
+// Declined, because reproducing PCL exactly would mean guessing: ASCII and
+// big-endian encodings, coordinates stored as double or as an integer type (PCL
+// converts those), list properties inside the vertex element, an `obj_info`
+// line, and `camera` or `range_grid` elements carrying data. Where PCL's
+// general reader is linked in those fall back to it; where it is not, they are
+// reported as an unsupported variant so the caller can say so precisely.
+
 namespace fast_ply {
 
 // Why LoadBinaryXyzPly() declined a file. The distinction matters because only
@@ -54,18 +62,18 @@ namespace fast_ply {
 enum class LoadFailure {
   // The file was loaded; nothing was declined.
   kNone,
-  // The file could not be opened, or its size could not be determined. PCL's
-  // reader would not have got any further.
-  kCannotOpen,
-  // The file opened, but it is not a plain binary_little_endian float x/y/z PLY
-  // with a single vertex element -- or its data block does not have exactly the
-  // length the header implies. PCL's general reader may well handle it.
+  // The file could not be opened, its size could not be determined, or it stops
+  // inside the vertex block. PCL's reader fails on these too (verified on a
+  // truncated file), so a caller should report them as it always has.
+  kUnreadable,
+  // The file opened and is intact, but it is in a PLY variant this reader does
+  // not reproduce exactly (see above). PCL's general reader may well handle it.
   kNotFastPathShape,
 };
 
-// Loads `path` into `cloud` on the fast path. Returns true only if the file
-// matched the supported layout and was read completely; in that case `cloud`
-// holds exactly what pcl::io::loadPLYFile() would have produced. Returns false
+// Loads `path` into `cloud`. Returns true only if the file matched a supported
+// layout and its vertex block was read completely; in that case `cloud` holds
+// exactly what pcl::io::loadPLYFile() would have produced. Returns false
 // without leaving usable data in `cloud` otherwise; the caller must then fall
 // back to pcl::io::loadPLYFile() (which will also emit the usual PCL error
 // messages if the file is genuinely unreadable).
