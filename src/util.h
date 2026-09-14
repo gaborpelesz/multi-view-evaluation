@@ -31,7 +31,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <unordered_map>
 #include <vector>
 
 #include <pcl/point_cloud.h>
@@ -40,51 +39,9 @@
 typedef pcl::PointCloud<pcl::PointXYZ> PointCloud;
 typedef pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudPtr;
 
-// Make std::unordered_map work with generic tuples.
-// Source: http://stackoverflow.com/questions/7110301
-// Note that this is not standard-conformant.
-namespace std {
-  namespace {
-    // Code from boost
-    // Reciprocal of the golden ratio helps spread entropy
-    //     and handles duplicates.
-    // See Mike Seymour in magic-numbers-in-boosthash-combine:
-    //     http://stackoverflow.com/questions/4948780
-    
-    template <class T>
-    inline void hash_combine(std::size_t& seed, T const& v) {
-      seed ^= std::hash<T>()(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
-    }
-    
-    // Recursive template code derived from Matthieu M.
-    template <class Tuple, size_t Index = std::tuple_size<Tuple>::value - 1>
-    struct HashValueImpl {
-      static void apply(size_t& seed, Tuple const& tuple) {
-        HashValueImpl<Tuple, Index-1>::apply(seed, tuple);
-        hash_combine(seed, std::get<Index>(tuple));
-      }
-    };
-    
-    template <class Tuple>
-    struct HashValueImpl<Tuple,0> {
-      static void apply(size_t& seed, Tuple const& tuple) {
-        hash_combine(seed, std::get<0>(tuple));
-      }
-    };
-  }
-  
-  template <typename ... TT>
-  struct hash<std::tuple<TT...>> {
-    size_t operator()(std::tuple<TT...> const& tt) const {
-      size_t seed = 0;
-      HashValueImpl<std::tuple<TT...> >::apply(seed, tt);
-      return seed;
-    }
-  };
-}
-
 // Integer coordinates of a voxel cell. Replaces the std::tuple<int, int, int>
-// key that used to be hashed by the specialization above; the full key is kept
+// key that upstream hashed through a std::hash specialization; the full key is
+// kept
 // (not packed lossily into fewer bits), so no coordinate range assumption is
 // made and two distinct cells can never be confused.
 struct VoxelCellKey {
