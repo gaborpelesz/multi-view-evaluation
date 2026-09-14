@@ -79,8 +79,18 @@ int main(int argc, char** argv) {
   // reconstruction. The two produce identical results; "flann" is the original
   // single-index code path, kept reachable as the reference implementation and
   // as the fallback on a host where the partitioned one has not been validated.
+  // "both" builds the two of them and checks that they agree bit for bit on
+  // every scan point, which is the differential test to run on a new host or on
+  // a scene shape this has not seen before.
   std::string nn_index = "partitioned";
   pcl::console::parse_argument(argc, argv, "--nn_index", nn_index);
+  // Number of sub-indices, when the partitioned index is in use. 0 means one
+  // per thread, which is the only setting the benchmark campaign uses; a fixed
+  // value exists so that a test can exercise the partitioned path at a thread
+  // count that would not otherwise produce one.
+  int nn_index_partitions = 0;
+  pcl::console::parse_argument(argc, argv, "--nn_index_partitions",
+                               nn_index_partitions);
 
   // Validate arguments.
   std::stringstream errors;
@@ -100,9 +110,13 @@ int main(int argc, char** argv) {
   if (voxel_size <= 0.f) {
     errors << "The voxel size must be positive." << std::endl;
   }
-  if (nn_index != "flann" && nn_index != "partitioned") {
-    errors << "The --nn_index parameter must be either 'flann' or"
-           << " 'partitioned'." << std::endl;
+  if (nn_index != "flann" && nn_index != "partitioned" && nn_index != "both") {
+    errors << "The --nn_index parameter must be one of 'flann',"
+           << " 'partitioned' or 'both'." << std::endl;
+  }
+  if (nn_index_partitions < 0) {
+    errors << "The --nn_index_partitions parameter must not be negative."
+           << std::endl;
   }
 
   if (!errors.str().empty()) {
@@ -187,8 +201,11 @@ int main(int argc, char** argv) {
   ComputeCompleteness(scan_infos, scans, reconstruction, voxel_size_inv,
                       tolerances, &completeness_results,
                       output_point_completeness ? &point_is_complete : nullptr,
-                      nn_index == "flann" ? NnIndexKind::kFlann
-                                          : NnIndexKind::kPartitioned);
+                      nn_index == "flann"
+                          ? NnIndexKind::kFlann
+                          : (nn_index == "both" ? NnIndexKind::kBoth
+                                                : NnIndexKind::kPartitioned),
+                      nn_index_partitions);
 
   // Write completeness visualization, if requested.
   if (output_point_completeness) {
