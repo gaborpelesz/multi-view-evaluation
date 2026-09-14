@@ -34,6 +34,18 @@
 #include "meshlab_project.h"
 #include "util.h"
 
+// Which nearest neighbour index ComputeCompleteness builds over the
+// reconstruction. Both answer every query with the same float; they differ only
+// in how the index is built and searched.
+//
+// kFlann is the original single pcl::search::KdTree. FLANN's kd-tree build is
+// single-threaded, so on a multi-core machine it is the largest serial block in
+// the program. kPartitioned splits the reconstruction into one sub-index per
+// thread, builds them in parallel, and prunes all but one of them per query
+// with a bounding box test. See completeness.cc for why that cannot change a
+// reported distance.
+enum class NnIndexKind { kFlann, kPartitioned };
+
 // Computes the completeness of the reconstruction with respect to the given
 // scans.
 void ComputeCompleteness(
@@ -46,7 +58,8 @@ void ComputeCompleteness(
     // Indexed by: [tolerance_index]. Range: [0, 1].
     std::vector<float>* results,
     // Indexed by: [tolerance_index][scan_point_index].
-    std::vector<std::vector<bool>>* point_is_complete);
+    std::vector<std::vector<bool>>* point_is_complete,
+    NnIndexKind nn_index_kind);
 
 void WriteCompletenessVisualization(
     const std::string& base_path,

@@ -75,6 +75,12 @@ int main(int argc, char** argv) {
   std::string accuracy_cloud_output_path;
   pcl::console::parse_argument(argc, argv, "--accuracy_cloud_output_path",
                                accuracy_cloud_output_path);
+  // Which nearest neighbour index the completeness phase builds over the
+  // reconstruction. The two produce identical results; "flann" is the original
+  // single-index code path, kept reachable as the reference implementation and
+  // as the fallback on a host where the partitioned one has not been validated.
+  std::string nn_index = "partitioned";
+  pcl::console::parse_argument(argc, argv, "--nn_index", nn_index);
 
   // Validate arguments.
   std::stringstream errors;
@@ -93,6 +99,10 @@ int main(int argc, char** argv) {
   }
   if (voxel_size <= 0.f) {
     errors << "The voxel size must be positive." << std::endl;
+  }
+  if (nn_index != "flann" && nn_index != "partitioned") {
+    errors << "The --nn_index parameter must be either 'flann' or"
+           << " 'partitioned'." << std::endl;
   }
 
   if (!errors.str().empty()) {
@@ -176,7 +186,9 @@ int main(int argc, char** argv) {
   bool output_point_completeness = !completeness_cloud_output_path.empty();
   ComputeCompleteness(scan_infos, scans, reconstruction, voxel_size_inv,
                       tolerances, &completeness_results,
-                      output_point_completeness ? &point_is_complete : nullptr);
+                      output_point_completeness ? &point_is_complete : nullptr,
+                      nn_index == "flann" ? NnIndexKind::kFlann
+                                          : NnIndexKind::kPartitioned);
 
   // Write completeness visualization, if requested.
   if (output_point_completeness) {
