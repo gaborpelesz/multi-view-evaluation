@@ -27,7 +27,6 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstdint>
-#include <iostream>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -430,10 +429,12 @@ void WriteCompletenessVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    if (!fast_ply::WriteBinaryXyzRgbPly(file_path.str(),
-                                        completeness_visualization)) {
-      std::cerr << "Cannot write completeness visualization to "
-                << file_path.str() << std::endl;
-    }
+    // The return value is deliberately dropped, because upstream drops it too:
+    // pcl::io::savePLYFileBinary() reported a write failure through PCL_ERROR,
+    // and main() sets the console verbosity to L_ALWAYS, which suppresses
+    // everything at L_ERROR and below. Reporting it here would put lines on
+    // stderr that the unmodified program does not emit -- for an empty cloud,
+    // which both writers refuse, on every tolerance.
+    fast_ply::WriteBinaryXyzRgbPly(file_path.str(), completeness_visualization);
   }
 }
