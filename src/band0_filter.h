@@ -92,12 +92,38 @@ class Band0VoxelFilter {
     // therefore bit-identical, and the accumulation is written below in
     // L2_Simple's own left-to-right order. The only remaining degree of freedom
     // is FMA contraction, which removes at most two roundings and so moves the
-    // result by well under 1e-6 relative. Accepting only at 2^-14 = 6.1e-5
-    // below t0^2 leaves that discrepancy no room to matter: whenever we accept,
+    // result by at most a couple of ulp. Accepting only at 2^-14 = 6.1e-5 below
+    // t0^2 leaves that discrepancy no room to matter: whenever we accept,
     // FLANN's own squared distance for the same pair is still < t0^2, so its
     // reported minimum is < t0^2 and the band walk yields 0.
+    //
+    // That argument is RELATIVE, and a float grid is only relative where it is
+    // normal. Both ends of the exponent range break it, so both are excluded:
+    //
+    //   - Below FLT_MIN the spacing between neighbouring floats stops scaling
+    //     with the value and is the fixed 2^-149, so t0^2 * (1 - 2^-14) rounds
+    //     straight back to t0^2 for every t0 <= 3.39e-21. The filter would then
+    //     accept d2 == t0^2, which the original's strict
+    //     'knn_squared_dists[0] < maximum_tolerance_squared' rejects whenever t0
+    //     is also the coarsest tolerance -- an observable difference, not a
+    //     missed opportunity. Even where the product does step down by one ulp,
+    //     a one-ulp margin is less than contraction can move the value.
+    //
+    //   - Above about 1.85e19 the square overflows to +inf, and 'd2 <= +inf'
+    //     accepts a d2 that has itself overflowed, which the strict '<' again
+    //     rejects.
+    //
+    // Requiring t0^2 to be a normal float rules out both, and leaves the margin
+    // worth at least 2^9 ulp of the values being compared. The strict
+    // inequality the proof actually uses is then re-checked rather than assumed.
+    if (!std::isnormal(finest_tolerance_squared)) {
+      return false;
+    }
     accept_squared_ =
         finest_tolerance_squared * (1.0f - 0x1p-14f);
+    if (!(accept_squared_ < finest_tolerance_squared)) {
+      return false;
+    }
 
     // The CSR offsets are uint32_t, so a cloud they could not address is
     // declined outright rather than silently wrapped. PCL cannot produce one
