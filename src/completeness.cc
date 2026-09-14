@@ -27,6 +27,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -35,6 +37,8 @@
 #include <pcl/common/transforms.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
+
+#include "nn_grid.h"
 
 const int kGridCount = 2;
 const float kGridShifts[kGridCount][3] = {{0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}};
@@ -86,12 +90,131 @@ struct CompletenessCellGrid {
   VoxelCellIndexMap map_;
 };
 
+// The completeness classification of one squared nearest-neighbour distance:
+// the smallest tolerance index for which the scan point counts as complete, or
+// tolerances_count if it counts as complete for no tolerance at all.
+//
+// This is the ONLY channel through which a nearest-neighbour distance reaches
+// the output, which is what makes the two index implementations comparable: an
+// answer that differs in its last bits is invisible unless the two answers fall
+// on opposite sides of one of the tolerance thresholds. --nn_verify compares
+// this function's result, not just the raw floats.
+//
+// The test against the maximum tolerance is written as !(d < t) rather than
+// (d >= t) so that a NaN distance -- which is what a non-finite scan point
+// produces -- takes the "not complete" branch, exactly as the original
+// if/else did.
+static inline uint32_t ClassifyNnDistance(
+    float nn_squared_distance, float maximum_tolerance_squared,
+    const float* sorted_tolerances_squared, size_t tolerances_count) {
+  if (!(nn_squared_distance < maximum_tolerance_squared)) {
+    return static_cast<uint32_t>(tolerances_count);
+  }
+  // A reconstruction point was found within the maximum tolerance, so this scan
+  // point is complete for the maximum tolerance at least. Find the smallest
+  // tolerance for which it is still complete.
+  int smallest_complete_tolerance_index = 0;
+  for (int tolerance_index = static_cast<int>(tolerances_count) - 2;
+       tolerance_index >= 0; --tolerance_index) {
+    if (sorted_tolerances_squared[tolerance_index] < nn_squared_distance) {
+      // The scan point is not completed for the current tolerance index.
+      smallest_complete_tolerance_index = tolerance_index + 1;
+      break;
+    }
+  }
+  return static_cast<uint32_t>(smallest_complete_tolerance_index);
+}
+
+// Queries BOTH nearest neighbour indices over every scan point and reports how
+// often they disagree; aborts if any disagreement could change a point's
+// classification.
+//
+// This exists because exactly one link in the bit-exactness argument for
+// ReconNnGrid is not a proof but a statement about code generation: that the
+// compiler turns the three-term float accumulation in the grid's inner loop
+// into the same rounding sequence that the precompiled FLANN inside
+// libpcl_kdtree uses (on arm64, an fmadd chain). That is true on the hosts this
+// was developed and gated on, and it is checkable at runtime anywhere -- so it
+// is checked here rather than assumed, over the real scene and all of its
+// points, which is a far stronger test than a synthetic self-check over a few
+// thousand points would be.
+//
+// It is deliberately opt-in: running it always would build the kd-tree and
+// double the query work in the very phase this index exists to make fast, which
+// would corrupt the measurement. Run it once per host and per scene.
+static void VerifyNnIndices(const PointCloud& scan, const ReconNnGrid& grid,
+                            pcl::search::KdTree<pcl::PointXYZ>& kdtree,
+                            float maximum_tolerance_squared,
+                            const float* sorted_tolerances_squared,
+                            size_t tolerances_count) {
+  const long long int scan_point_size =
+      static_cast<long long int>(scan.size());
+  long long int value_mismatches = 0;
+  long long int band_mismatches = 0;
+
+#pragma omp parallel reduction(+ : value_mismatches, band_mismatches)
+  {
+    pcl::PointXYZ search_point;
+    pcl::Indices knn_indices(1);
+    std::vector<float> knn_squared_dists(1);
+
+#pragma omp for schedule(dynamic, 4096)
+    for (long long int scan_point_index = 0; scan_point_index < scan_point_size;
+         ++scan_point_index) {
+      const pcl::PointXYZ& scan_point = scan.at(scan_point_index);
+      const float grid_squared_distance = grid.NearestSquaredDistance(
+          scan_point.x, scan_point.y, scan_point.z);
+
+      search_point.getVector3fMap() = scan_point.getVector3fMap();
+      knn_squared_dists[0] = std::numeric_limits<float>::infinity();
+      kdtree.nearestKSearch(search_point, 1, knn_indices, knn_squared_dists);
+      const float flann_squared_distance = knn_squared_dists[0];
+
+      // Two answers that are both at or above the maximum tolerance are
+      // interchangeable by construction -- that is the whole point of the
+      // grid's search radius cap -- so only their bits are compared when at
+      // least one of them is below it.
+      if ((grid_squared_distance < maximum_tolerance_squared ||
+           flann_squared_distance < maximum_tolerance_squared) &&
+          std::memcmp(&grid_squared_distance, &flann_squared_distance,
+                      sizeof(float)) != 0) {
+        ++value_mismatches;
+      }
+      if (ClassifyNnDistance(grid_squared_distance, maximum_tolerance_squared,
+                             sorted_tolerances_squared, tolerances_count) !=
+          ClassifyNnDistance(flann_squared_distance, maximum_tolerance_squared,
+                             sorted_tolerances_squared, tolerances_count)) {
+        ++band_mismatches;
+      }
+    }
+  }
+
+  std::fprintf(stderr,
+               "nn_verify: grid cell size %g m over %llu cells, %zu candidate "
+               "points\n",
+               grid.cell_size(),
+               static_cast<unsigned long long>(grid.cell_count()),
+               grid.point_count());
+  std::fprintf(stderr,
+               "nn_verify: %lld scan points, %lld squared distances differing "
+               "in any bit, %lld differing classifications\n",
+               scan_point_size, value_mismatches, band_mismatches);
+  if (band_mismatches != 0) {
+    std::fprintf(stderr,
+                 "nn_verify: FAILED -- the grid index does not reproduce the "
+                 "kd-tree's classification on this host. Re-run with "
+                 "--nn_index flann.\n");
+    std::abort();
+  }
+}
+
 void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
                          const std::vector<PointCloudPtr>& scans,
                          const PointCloudPtr& reconstruction,
                          float voxel_size_inv,
                          // Sorted by increasing tolerance.
                          const std::vector<float>& sorted_tolerances,
+                         NnIndexKind nn_index, bool nn_verify,
                          // Indexed by: [tolerance_index]. Range: [0, 1].
                          std::vector<float>* results,
                          // Indexed by: [tolerance_index][scan_point_index].
@@ -134,12 +257,6 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
     return;
   }
 
-  pcl::search::KdTree<pcl::PointXYZ> reconstruction_kdtree;
-  // Get sorted results from radius search. True should be the default, but be
-  // on the safe side for the case of changing defaults:
-  reconstruction_kdtree.setSortedResults(true);
-  reconstruction_kdtree.setInputCloud(reconstruction);
-
   // Differently shifted voxel grids.
   // Indexed by: [map_index], then by the dense cell id that the grid assigns to
   // CalcCellCoordinates(...).
@@ -156,6 +273,25 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   const float maximum_tolerance_squared =
       static_cast<float>(static_cast<double>(maximum_tolerance) *
                          static_cast<double>(maximum_tolerance));
+
+  // The nearest neighbour index. ReconNnGrid is a uniform-voxel CSR index built
+  // by a parallel counting sort; pcl::search::KdTree is the original FLANN
+  // kd-tree, whose build is a single-threaded half second and which is kept
+  // reachable as the reference implementation. Only one of the two is built
+  // unless --nn_verify asked for both.
+  const bool use_grid = (nn_index == NnIndexKind::kGrid);
+  ReconNnGrid reconstruction_grid;
+  if (use_grid || nn_verify) {
+    reconstruction_grid.Build(*reconstruction, maximum_tolerance,
+                              maximum_tolerance_squared);
+  }
+  pcl::search::KdTree<pcl::PointXYZ> reconstruction_kdtree;
+  if (!use_grid || nn_verify) {
+    // Get sorted results from radius search. True should be the default, but be
+    // on the safe side for the case of changing defaults:
+    reconstruction_kdtree.setSortedResults(true);
+    reconstruction_kdtree.setInputCloud(reconstruction);
+  }
 
   const long long int scan_point_size =
       static_cast<long long int>(scan->size());
@@ -233,8 +369,17 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
         static_cast<uint32_t>(tolerances_count));
   }
 
+  const float* const sorted_tolerances_squared_ptr =
+      sorted_tolerances_squared.data();
+
+  if (nn_verify) {
+    VerifyNnIndices(*scan, reconstruction_grid, reconstruction_kdtree,
+                    maximum_tolerance_squared, sorted_tolerances_squared_ptr,
+                    tolerances_count);
+  }
+
   // Pass 2 (parallel): the nearest neighbour search. Every iteration reads the
-  // kd-tree and writes only integer tallies of its own cells plus its own entry
+  // index and writes only integer tallies of its own cells plus its own entry
   // of the per-point output, so the loop is free of ordering constraints.
 #pragma omp parallel
   {
@@ -252,10 +397,10 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
       // Find the closest reconstruction point to this scan point.
       //
       // This used to be radiusSearch(maximum_tolerance, ..., max_nn = kNN),
-      // which asks the kd-tree a much more expensive question than the answer
-      // requires. Only knn_squared_dists[0] is ever read below; knn_indices is
-      // never used. With max_nn = 1 FLANN answers a radius query with a
-      // KNNRadiusResultSet of capacity 1, i.e. it returns the single nearest
+      // which asks the index a much more expensive question than the answer
+      // requires. Only the squared distance is ever read below; the neighbour's
+      // index is never used. With max_nn = 1 FLANN answers a radius query with
+      // a KNNRadiusResultSet of capacity 1, i.e. it returns the single nearest
       // neighbour, and reports it only when its squared distance is strictly
       // smaller than the squared radius (KNNRadiusResultSet::addPoint returns
       // early on dist >= worst_dist_ and worst_dist_ starts at radius^2; the
@@ -264,34 +409,29 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
       // nearest neighbour -- both searches are exact and L2_Simple computes the
       // squared distance identically -- so testing that distance against
       // maximum_tolerance_squared with a strict '<' reproduces the radius
-      // search exactly, while letting the tree shrink its search bound from the
-      // first candidate on instead of descending every node that overlaps a
-      // 0.5 m ball.
-      search_point.getVector3fMap() = scan_point.getVector3fMap();
-      // pcl::KdTreeFLANN::nearestKSearch returns min(k, cloud size)
-      // unconditionally rather than the number of neighbours actually written,
-      // so its return value cannot be used to detect "nothing found" (which
-      // FLANN does produce for a non-finite query point). Pre-seeding the slot
-      // with infinity makes that case fail the tolerance test, which is exactly
-      // what radiusSearch returning 0 did.
-      knn_squared_dists[0] = std::numeric_limits<float>::infinity();
-      reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
-                                           knn_squared_dists);
-      if (knn_squared_dists[0] < maximum_tolerance_squared) {
-        // Since a reconstruction point was found within the search radius, this
-        // scan point is complete for the maximum tolerance, at least. Find the
-        // smallest tolerance for which it is still complete.
-        int smallest_complete_tolerance_index = 0;
-        for (int tolerance_index = static_cast<int>(tolerances_count) - 2;
-             tolerance_index >= 0; --tolerance_index) {
-          if (sorted_tolerances_squared[tolerance_index] <
-              knn_squared_dists[0]) {
-            // The scan point is not completed for the current tolerance index.
-            smallest_complete_tolerance_index = tolerance_index + 1;
-            break;
-          }
-        }
+      // search exactly.
+      float nn_squared_distance;
+      if (use_grid) {
+        nn_squared_distance = reconstruction_grid.NearestSquaredDistance(
+            scan_point.x, scan_point.y, scan_point.z);
+      } else {
+        search_point.getVector3fMap() = scan_point.getVector3fMap();
+        // pcl::KdTreeFLANN::nearestKSearch returns min(k, cloud size)
+        // unconditionally rather than the number of neighbours actually
+        // written, so its return value cannot be used to detect "nothing found"
+        // (which FLANN does produce for a non-finite query point). Pre-seeding
+        // the slot with infinity makes that case fail the tolerance test, which
+        // is exactly what radiusSearch returning 0 did.
+        knn_squared_dists[0] = std::numeric_limits<float>::infinity();
+        reconstruction_kdtree.nearestKSearch(search_point, kNN, knn_indices,
+                                             knn_squared_dists);
+        nn_squared_distance = knn_squared_dists[0];
+      }
 
+      const uint32_t smallest_complete_tolerance_index = ClassifyNnDistance(
+          nn_squared_distance, maximum_tolerance_squared,
+          sorted_tolerances_squared_ptr, tolerances_count);
+      if (smallest_complete_tolerance_index < tolerances_count) {
         // The point is complete for every tolerance index from
         // smallest_complete_tolerance_index upwards. Record that as a single
         // histogram bin; the cumulative counts are formed below. Counting the
@@ -312,7 +452,7 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
 
         if (output_point_results) {
           smallest_complete_tolerance_indices[scan_point_index] =
-              static_cast<uint32_t>(smallest_complete_tolerance_index);
+              smallest_complete_tolerance_index;
         }
       }
     }

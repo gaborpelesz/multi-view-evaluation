@@ -75,6 +75,13 @@ int main(int argc, char** argv) {
   std::string accuracy_cloud_output_path;
   pcl::console::parse_argument(argc, argv, "--accuracy_cloud_output_path",
                                accuracy_cloud_output_path);
+  // Which nearest neighbour index the completeness pass queries. "grid" is the
+  // uniform-voxel index and the default; "flann" is the original
+  // pcl::search::KdTree, kept reachable so that a host whose precompiled FLANN
+  // rounds differently can still reproduce the reference numbers.
+  std::string nn_index_name = "grid";
+  pcl::console::parse_argument(argc, argv, "--nn_index", nn_index_name);
+  const bool nn_verify = pcl::console::find_switch(argc, argv, "--nn_verify");
 
   // Validate arguments.
   std::stringstream errors;
@@ -93,6 +100,10 @@ int main(int argc, char** argv) {
   }
   if (voxel_size <= 0.f) {
     errors << "The voxel size must be positive." << std::endl;
+  }
+  if (nn_index_name != "grid" && nn_index_name != "flann") {
+    errors << "The --nn_index parameter must be either 'grid' or 'flann'."
+           << std::endl;
   }
 
   if (!errors.str().empty()) {
@@ -175,7 +186,10 @@ int main(int argc, char** argv) {
   std::vector<std::vector<bool>> point_is_complete;
   bool output_point_completeness = !completeness_cloud_output_path.empty();
   ComputeCompleteness(scan_infos, scans, reconstruction, voxel_size_inv,
-                      tolerances, &completeness_results,
+                      tolerances,
+                      (nn_index_name == "flann") ? NnIndexKind::kFlann
+                                                 : NnIndexKind::kGrid,
+                      nn_verify, &completeness_results,
                       output_point_completeness ? &point_is_complete : nullptr);
 
   // Write completeness visualization, if requested.
