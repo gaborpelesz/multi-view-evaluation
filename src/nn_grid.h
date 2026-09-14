@@ -70,6 +70,20 @@
 //     kBoundSlack, so rounding in the bound can only make the probe examine
 //     more cells, never fewer.
 //
+//     That invariant has a domain, and the domain is enforced from BOTH
+//     sides, which is the part it is easy to get wrong. From above, the grid
+//     is never made finer than the exponent for which a scaled coordinate
+//     could leave the range where double arithmetic on it is exact
+//     (kMaxGridCoordinate). From below, the cell-size search only ever
+//     terminates once the cell count is inside the budget, and the budget is
+//     small enough that every axis dimension, every flat cell id and the cell
+//     array's own size are inside the integer types that hold them. A search
+//     that could end on the coarse side WITHOUT meeting the budget would wrap
+//     a uint32 cell id, file points in cells that do not contain them, and
+//     break the containment invariant just as thoroughly as an over-fine grid
+//     -- so Build refuses to return an index at all rather than return one it
+//     cannot make exact, and the caller answers from the kd-tree instead.
+//
 // (2) THE SEARCH RADIUS CAP. Once the shell boundary is at or beyond the
 //     maximum tolerance, every unexamined point has a squared distance at or
 //     above the caller's squared threshold, and the caller's test is a strict
@@ -101,7 +115,16 @@ class ReconNnGrid {
   // `maximum_tolerance` and `maximum_tolerance_squared` are the caller's
   // largest tolerance and the exact float it compares against; the probe uses
   // them to stop expanding once no further point could pass that test.
-  void Build(const PointCloud& cloud, float maximum_tolerance,
+  //
+  // Returns false if no grid satisfying the index's own domain bounds exists
+  // for this cloud, in which case the object is left empty and MUST NOT be
+  // queried -- the caller has to fall back to the kd-tree. No cloud of finite
+  // float coordinates can trigger that (see kMinGridExponent in the .cc), so
+  // the path is a backstop for a broken assumption rather than a case the
+  // campaign will meet; it exists because the alternative to refusing is
+  // answering with cell ids that have wrapped, which is a wrong number that
+  // looks like a result.
+  bool Build(const PointCloud& cloud, float maximum_tolerance,
              float maximum_tolerance_squared);
 
   // Squared distance to the closest point of the cloud, or +infinity if no
