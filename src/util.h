@@ -144,6 +144,36 @@ class VoxelCellIndexMap {
 
   inline VoxelCellIndexMap() : size_(0) { AllocateTable(1024); }
 
+  // Sizes the table so that expected_cells distinct cells fit into it without a
+  // single rehash, and must therefore be called before the first Lookup(). The
+  // table is allocated with the smallest power of two strictly greater than
+  // 2 * expected_cells slots, which is one slot more than Lookup()'s growth
+  // rule (2 * size_ >= slots_.size()) needs to stay quiet for that many cells.
+  //
+  // This only picks the table geometry. The dense index a cell receives is the
+  // value of size_ at its first insertion, which depends solely on the order in
+  // which distinct keys are looked up -- so reserving too much, too little or
+  // nothing at all cannot change a single index. An underestimate merely lets
+  // Grow() run as before.
+  inline void Reserve(size_t expected_cells) {
+    if (size_ != 0) {
+      // Reserving after the first insertion would be a programming error: the
+      // caller would be paying for a rehash it asked to avoid.
+      std::fprintf(stderr, "VoxelCellIndexMap: Reserve() after first insert\n");
+      std::abort();
+    }
+    // At most kEmptySlot - 1 cells can ever be indexed, so there is no point in
+    // allocating a table for more than that; this also bounds the doubling.
+    if (expected_cells >= kEmptySlot) {
+      expected_cells = kEmptySlot - 1;
+    }
+    size_t slot_count = 1024;
+    while (slot_count <= 2 * expected_cells) {
+      slot_count *= 2;
+    }
+    AllocateTable(slot_count);
+  }
+
   // Returns the dense index of the cell with the given coordinates, creating
   // the cell if it does not exist yet. *inserted is set to true exactly if a
   // new cell was created, in which case the returned index equals the previous
@@ -246,3 +276,49 @@ class VoxelCellIndexMap {
   size_t mask_;
   uint32_t size_;
 };
+
+// Estimates how many distinct cells the given points will occupy in the voxel
+// grid described by voxel_size_inv and the shift, so that a VoxelCellIndexMap
+// can be Reserve()d up front instead of doubling its way there from 1024 slots.
+//
+// The estimate is taken from every 32nd point: those are counted into a
+// throwaway table (~3% of the points, so a few tens of thousands of probes),
+// and the distinct-cell fraction observed in the sample is extrapolated to the
+// whole point set with 15% headroom. The sample is strided rather than random
+// so that the function is deterministic, but the value it returns is only ever
+// used to pick a table size, which provably cannot change any cell index (see
+// VoxelCellIndexMap::Reserve), so neither the sampling rule nor the accuracy of
+// the estimate is load-bearing for the result -- only for the memory used and
+// for how many rehashes are avoided.
+//
+// The extrapolation is done in integer arithmetic: no rounding decision is left
+// to the floating point unit. The result is clamped to point_count, which is a
+// hard upper bound on the number of occupied cells.
+inline size_t EstimateDistinctCellCount(const pcl::PointXYZ* points,
+                                        size_t point_count,
+                                        float voxel_size_inv, float shift_x,
+                                        float shift_y, float shift_z) {
+  if (point_count == 0) {
+    return 0;
+  }
+  const size_t kSampleStride = 32;
+  VoxelCellIndexMap sample_map;
+  size_t sampled_count = 0;
+  for (size_t point_index = 0; point_index < point_count;
+       point_index += kSampleStride) {
+    bool inserted;
+    sample_map.Lookup(CalcCellCoordinates(points[point_index], voxel_size_inv,
+                                          shift_x, shift_y, shift_z),
+                      &inserted);
+    ++ sampled_count;
+  }
+
+  // distinct_in_sample * 1.15 * point_count / sampled_count, rounded up, as
+  // 23/20 to keep it exact and integral.
+  uint64_t estimate = (static_cast<uint64_t>(sample_map.size()) * 23 + 19) / 20;
+  estimate = (estimate * point_count + sampled_count - 1) / sampled_count;
+  if (estimate > point_count) {
+    estimate = point_count;
+  }
+  return static_cast<size_t>(estimate);
+}
