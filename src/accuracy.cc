@@ -511,6 +511,33 @@ inline void ClassifyPoint(const Eigen::Vector3f& cartesian_reconstruction_point,
   }
 }
 
+// Keeps GridBuildThreadCount() out of line.
+//
+// MEASURED, NOT DEFENSIVE. ComputeAccuracy is one very large function: the
+// serial cell-id pass and the parallel classification loop (pass 2) share it.
+// When GridBuildThreadCount is inlined into it, the function crosses a
+// threshold in the inliner's budget and pass 2 comes out measurably worse --
+// on the bench dataset at 12 threads the accuracy phase goes from 0.180 s to
+// 0.248 s, a 38% regression in a phase this campaign spent two optimizations
+// shrinking, and the whole program from 0.395 s to 0.463 s. The effect is a
+// property of THIS combination: the same helper on opt/combo-c, before the
+// voxel-presize work reshaped the cell-id pass, cost nothing.
+//
+// Any perturbation of the function moves it back to the fast side -- a
+// temporary probe timer, an early `getenv` return, this attribute -- which is
+// what identifies the cause as the inlining decision rather than the helper's
+// own cost. The attribute states the intent directly instead of relying on an
+// accident of source layout to keep the fast codegen.
+//
+// It cannot change what is computed: it constrains only where the call is
+// emitted, never the value returned, and the returned value is a thread count
+// that the loop's independent iterations make unobservable in the output.
+#if defined(__GNUC__) || defined(__clang__)
+#define MVE_NOINLINE __attribute__((noinline))
+#else
+#define MVE_NOINLINE
+#endif
+
 // Scratch bytes SphericalPointGrid::Build holds per scan point for the whole
 // call: the converted-but-not-yet-binned points plus their cell indices.
 const size_t kGridBuildScratchBytesPerPoint =
@@ -549,7 +576,13 @@ const size_t kGridBuildScratchFloorBytes = static_cast<size_t>(512) << 20;
 // requires. It cannot change what is computed either: the loop iterations are
 // independent, so the number of threads that run them is not observable in the
 // output.
-static int GridBuildThreadCount(const std::vector<PointCloudPtr>& scans) {
+// Kept out of line deliberately; see MVE_NOINLINE above. This is a one-off
+// preparation call whose cost is three integer divisions, so nothing is lost by
+// not inlining it -- and a great deal is lost by inlining it, because
+// ComputeAccuracy also contains the parallel classification loop (pass 2) that
+// dominates the phase.
+MVE_NOINLINE static int GridBuildThreadCount(
+    const std::vector<PointCloudPtr>& scans) {
   int max_threads = 1;
 #ifdef _OPENMP
   max_threads = omp_get_max_threads();
