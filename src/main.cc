@@ -75,6 +75,13 @@ int main(int argc, char** argv) {
   std::string accuracy_cloud_output_path;
   pcl::console::parse_argument(argc, argv, "--accuracy_cloud_output_path",
                                accuracy_cloud_output_path);
+  // The completeness phase overlaps its two serial preparation blocks -- the
+  // reconstruction index build and the scan cell assignment -- on a two-thread
+  // team. This switch restores the original back-to-back order at any thread
+  // count, so both arrangements can be measured from one binary over one input.
+  // It changes no computed value; see ComputeCompleteness in completeness.cc.
+  bool serial_prepare =
+      pcl::console::find_switch(argc, argv, "--serial_prepare");
 
   // Validate arguments.
   std::stringstream errors;
@@ -175,7 +182,7 @@ int main(int argc, char** argv) {
   std::vector<std::vector<bool>> point_is_complete;
   bool output_point_completeness = !completeness_cloud_output_path.empty();
   ComputeCompleteness(scan_infos, scans, reconstruction, voxel_size_inv,
-                      tolerances, &completeness_results,
+                      tolerances, serial_prepare, &completeness_results,
                       output_point_completeness ? &point_is_complete : nullptr);
 
   // Write completeness visualization, if requested.

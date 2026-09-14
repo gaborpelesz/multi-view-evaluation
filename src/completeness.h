@@ -43,6 +43,12 @@ void ComputeCompleteness(
     float voxel_size_inv,
     // Sorted by increasing tolerance.
     const std::vector<float>& sorted_tolerances,
+    // If true, the two serial preparation blocks (the reconstruction index
+    // build and the scan cell assignment) run one after the other instead of
+    // concurrently, as they did before the overlap was introduced. Switching
+    // the overlap off this way rather than by lowering the thread count is what
+    // makes the two arrangements comparable at the same thread count.
+    bool serial_prepare,
     // Indexed by: [tolerance_index]. Range: [0, 1].
     std::vector<float>* results,
     // Indexed by: [tolerance_index][scan_point_index].
