@@ -160,19 +160,47 @@ class Band0VoxelFilter {
     const float lower[3] = {min_x, min_y, min_z};
     const float upper[3] = {max_x, max_y, max_z};
     bool fits = false;
-    for (int attempt = 0; attempt < 128; ++attempt) {
+    // 256 doublings take the cell size from 1/16 m past 2^250 m, which is far
+    // more than enough to bring any finite float extent inside both the index
+    // range and the cell budget below.
+    for (int attempt = 0; attempt < 256; ++attempt) {
       const double inv = 1.0 / cell_size;
       double total_cells = 1.0;
+      bool representable = true;
       for (int axis = 0; axis < 3; ++axis) {
-        const long long int lo = static_cast<long long int>(
-            std::floor(static_cast<double>(lower[axis]) * inv));
-        const long long int hi = static_cast<long long int>(
-            std::floor(static_cast<double>(upper[axis]) * inv));
-        origin[axis] = lo;
-        counts[axis] = hi - lo + 1;
+        // Range-check in double, BEFORE converting. A finite float coordinate
+        // reaches 3.4e38, so a cell size this fine can put the corner's cell
+        // index outside long long int, where the conversion is undefined --
+        // and its undefined result is not even the same everywhere: AArch64
+        // saturates to INT64_MAX, x86-64's cvttsd2si yields INT64_MIN. Either
+        // way the subtraction below would then produce a negative or absurd
+        // count whose NEGATIVE product passes the budget test, and a query
+        // against a grid with count 0 would index cell_start_ out of bounds.
+        // An out-of-range corner is not a failure of the filter: it means this
+        // cell size is too fine for the extent of this cloud, which is exactly
+        // what the coarsening step at the bottom of the loop answers.
+        const double lo_scaled =
+            std::floor(static_cast<double>(lower[axis]) * inv);
+        const double hi_scaled =
+            std::floor(static_cast<double>(upper[axis]) * inv);
+        if (!(std::fabs(lo_scaled) <= kMaxCellIndex) ||
+            !(std::fabs(hi_scaled) <= kMaxCellIndex)) {
+          representable = false;
+          break;
+        }
+        origin[axis] = static_cast<long long int>(lo_scaled);
+        // Both ends lie within +/-2^61 and floor is monotonic, so the
+        // difference is non-negative and below 2^62: neither it nor the
+        // increment can overflow.
+        counts[axis] = static_cast<long long int>(hi_scaled) - origin[axis] + 1;
         total_cells *= static_cast<double>(counts[axis]);
       }
-      if (total_cells <= static_cast<double>(kMaxCellCount)) {
+      // Every count is positive by the monotonicity just argued; the test makes
+      // that a checked precondition of the int narrowing and of AxisRange
+      // rather than an assumed one. With all counts >= 1 the budget bounds each
+      // of them individually, so the narrowing to int cannot overflow either.
+      if (representable && counts[0] >= 1 && counts[1] >= 1 && counts[2] >= 1 &&
+          total_cells <= static_cast<double>(kMaxCellCount)) {
         fits = true;
         break;
       }
@@ -312,6 +340,12 @@ class Band0VoxelFilter {
   // 32 M cells, i.e. 128 MB of offsets. Beyond this the grid is coarsened.
   static const uint32_t kMaxCellCount = 32u * 1024u * 1024u;
   static constexpr double kCoordinateLimit = 1e12;
+  // Largest magnitude a raw (pre-origin) cell index may have. Converting a
+  // double outside long long int's range to it is undefined behaviour, so every
+  // such conversion in this class is guarded by this bound. 2^61 leaves room
+  // for the difference of two in-range indices (below 2^62) and for the
+  // subtraction of an in-range origin from an in-range index.
+  static constexpr double kMaxCellIndex = 0x1p61;
 
   static inline bool IsUsable(float x, float y, float z) {
     return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
@@ -328,18 +362,21 @@ class Band0VoxelFilter {
     if (!IsUsable(x, y, z)) {
       return kNoCell;
     }
-    const long long int cx =
-        static_cast<long long int>(
-            std::floor(static_cast<double>(x) * inv_cell_size_)) -
-        origin_x_;
-    const long long int cy =
-        static_cast<long long int>(
-            std::floor(static_cast<double>(y) * inv_cell_size_)) -
-        origin_y_;
-    const long long int cz =
-        static_cast<long long int>(
-            std::floor(static_cast<double>(z) * inv_cell_size_)) -
-        origin_z_;
+    const double sx = std::floor(static_cast<double>(x) * inv_cell_size_);
+    const double sy = std::floor(static_cast<double>(y) * inv_cell_size_);
+    const double sz = std::floor(static_cast<double>(z) * inv_cell_size_);
+    // Range-check before converting, for the same reason as in Build(): the
+    // conversion of an out-of-range double is undefined. Build() chose the cell
+    // size so that both corners of the bounding box land inside kMaxCellIndex
+    // and every point of the cloud lies between them, so this never fires on a
+    // grid Build() accepted -- it is what makes that a checked invariant.
+    if (!(std::fabs(sx) <= kMaxCellIndex && std::fabs(sy) <= kMaxCellIndex &&
+          std::fabs(sz) <= kMaxCellIndex)) {
+      return kNoCell;
+    }
+    const long long int cx = static_cast<long long int>(sx) - origin_x_;
+    const long long int cy = static_cast<long long int>(sy) - origin_y_;
+    const long long int cz = static_cast<long long int>(sz) - origin_z_;
     // The bounding box was taken over exactly these points, so this holds; the
     // check is here so that a future change to the box cannot silently corrupt
     // memory.
@@ -356,6 +393,13 @@ class Band0VoxelFilter {
   // on this axis entirely.
   inline bool AxisRange(float q, long long int origin, int count, int* lo,
                         int* hi, int* home) const {
+    // An empty axis has no cell to return, and the clamping below would happily
+    // hand back the out-of-range index -1 for it. Build() cannot produce one,
+    // but the query path must not depend on that: this is the only place where
+    // a bad grid would reach an unchecked cell_start_ index.
+    if (count <= 0) {
+      return false;
+    }
     const double scaled = static_cast<double>(q) * inv_cell_size_;
     const double floored = std::floor(scaled);
     // Exact for |scaled| < 2^52, which the caller has established.
