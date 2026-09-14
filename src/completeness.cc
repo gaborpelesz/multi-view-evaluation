@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -122,6 +123,24 @@ constexpr size_t kSplitTaskThreshold = 65536;
 // the search visit a partition it would otherwise have skipped, and only for
 // query points sitting within a relative 4e-6 of a box face.
 constexpr double kBoundShrink = 1.0 - 1.0 / 262144.0;
+
+// How many scan points the probe that measures sub-tree searches per query
+// samples. 8192 queries cost a few milliseconds even when every one of them has
+// to search every partition, and the quantity being estimated is a mean over
+// millions of points, so the sampling error at this size is far below the
+// margin the threshold below is set with.
+constexpr size_t kProbeSampleTarget = 8192;
+
+// The measured mean above which the partitioned index is abandoned for the
+// single one. The saving from building in parallel is fixed -- ~0.45 s of
+// serial time on the benchmark machine -- while the query pass grows roughly in
+// proportion to this mean from its ~0.25 s at 1.0, so break-even sits somewhere
+// between 2 and 3. The threshold is set at 1.5 to keep a margin rather than to
+// sit on that point, and because a mean that has drifted that far from 1 is
+// evidence that the model behind this index does not hold on the scene at all.
+// Falling back costs the partitioned build that has already happened, which is
+// about a tenth of the single build it then performs.
+constexpr double kMaxSubtreeSearchesPerQuery = 1.5;
 
 // A partition's axis-aligned bounding box, computed from the points that
 // actually landed in it rather than from the splitting planes. A tight box
@@ -294,9 +313,7 @@ void SplitPartitions(PartitionPoint* points, size_t begin, size_t end,
 //    coincident points, collinear and planar partitions, denormal and overflow
 //    scale coordinates, an exact-tolerance lattice, and coordinates 1e5 m from
 //    the origin.
-//  * --nn_index both runs both shapes over the same scan and reports any
-//    disagreement, so a new host or an unfamiliar scene is one run away from an
-//    answer; --nn_index flann is the way out if one ever fires.
+//  * --nn_index flann is the way out if one ever fires.
 // Closing it by proof would mean vendoring FLANN, which would recompile
 // L2_Simple with this project's flags and trade a bound that has never been
 // observed to move for an FMA contraction risk that certainly would.
@@ -308,6 +325,14 @@ class ReconstructionNearestIndex {
   // run identical in shape to the original.
   void Build(const PointCloudPtr& cloud, int requested_partitions);
 
+  // Builds (or rebuilds as) the single index over the whole cloud, which is the
+  // original code path. Rebuilding is what the caller does when the probe finds
+  // that box pruning has collapsed on this scene.
+  void BuildSingleIndex(const PointCloudPtr& cloud);
+
+  // 1 while a single index is in use, otherwise the number of sub-trees.
+  int partition_count() const { return static_cast<int>(trees_.size()); }
+
   // Squared distance to the nearest reconstruction point, or +infinity if
   // FLANN reported nothing (which it does for a non-finite query point).
   // The two scratch vectors are the caller's, one set per thread, and must have
@@ -315,7 +340,28 @@ class ReconstructionNearestIndex {
   inline float NearestSquaredDistance(
       const pcl::PointXYZ& point, pcl::Indices* knn_indices,
       std::vector<float>* knn_squared_dists) const {
+    return Search<false>(point, knn_indices, knn_squared_dists, nullptr);
+  }
+
+  // The same query, additionally adding the number of sub-trees it searched to
+  // *searches. Separate instantiation rather than a runtime flag so that the
+  // counter cannot cost the hot loop anything: only the probe and the
+  // --nn_index both check call this one.
+  inline float NearestSquaredDistanceCounted(
+      const pcl::PointXYZ& point, pcl::Indices* knn_indices,
+      std::vector<float>* knn_squared_dists, int* searches) const {
+    return Search<true>(point, knn_indices, knn_squared_dists, searches);
+  }
+
+ private:
+  template <bool kCountSearches>
+  inline float Search(const pcl::PointXYZ& point, pcl::Indices* knn_indices,
+                      std::vector<float>* knn_squared_dists,
+                      int* searches) const {
     if (boxes_.empty()) {
+      if constexpr (kCountSearches) {
+        ++*searches;
+      }
       return QueryTree(0, point, knn_indices, knn_squared_dists);
     }
 
@@ -332,11 +378,17 @@ class ReconstructionNearestIndex {
     // Searching the closest box first is what makes the loop below skip the
     // rest: after it, `best` is already a real neighbour distance, typically
     // millimetres against metre-sized boxes.
+    if constexpr (kCountSearches) {
+      ++*searches;
+    }
     float best = QueryTree(nearest_partition, point, knn_indices,
                            knn_squared_dists);
     for (int i = 0; i < partition_count; ++i) {
       if (i == nearest_partition || !(bounds[i] < static_cast<double>(best))) {
         continue;
+      }
+      if constexpr (kCountSearches) {
+        ++*searches;
       }
       const float candidate = QueryTree(i, point, knn_indices,
                                         knn_squared_dists);
@@ -347,7 +399,6 @@ class ReconstructionNearestIndex {
     return best;
   }
 
- private:
   inline float QueryTree(int partition, const pcl::PointXYZ& point,
                          pcl::Indices* knn_indices,
                          std::vector<float>* knn_squared_dists) const {
@@ -465,12 +516,74 @@ void ReconstructionNearestIndex::Build(const PointCloudPtr& cloud,
   }
 
   // Single index over the whole cloud: the original code path, unchanged.
+  BuildSingleIndex(cloud);
+}
+
+void ReconstructionNearestIndex::BuildSingleIndex(const PointCloudPtr& cloud) {
+  // Drop any sub-trees before building, so that a fallback never holds two full
+  // indices over the same cloud at the same time.
+  trees_.clear();
+  boxes_.clear();
+  partition_indices_.clear();
+
   trees_.resize(1);
   trees_[0] = std::make_shared<pcl::search::KdTree<pcl::PointXYZ>>();
   // Get sorted results from radius search. True should be the default, but be
   // on the safe side for the case of changing defaults:
   trees_[0]->setSortedResults(true);
   trees_[0]->setInputCloud(cloud);
+}
+
+// Mean number of sub-tree searches one query performs, measured on a stride
+// sample of the points that are about to be queried for real.
+//
+// The entire cost model of the partitioned index rests on this number. It is
+// 1.007 on the benchmark scene -- a query is answered by the sub-tree whose box
+// it falls into, and only 0.7% of scan points sit close enough to a partition
+// face for the second-closest box to still be in play -- but it is a property
+// of the scene, not a constant of the algorithm. Its range is 1 to P. Geometry
+// whose partition boxes all contain the query points drives it to the top of
+// that range, and that geometry is not exotic: a ground truth scan of a room
+// whose reconstruction covers only the walls is a hollow shell with the queries
+// inside it, which is exactly the failure mode of a method under evaluation. A
+// synthetic room shell of that shape measures 1.87 here, and a sphere shell
+// with the queries in its empty interior measures 12.0000 -- every query
+// searching every one of the twelve sub-trees, pruning gone completely. The
+// caller uses this number to decide whether to keep the partitioned index at
+// all; see kMaxSubtreeSearchesPerQuery.
+//
+// The sample is a fixed stride over the scan, so the number -- and therefore
+// the decision -- is the same on every run of the same input.
+double MeasureSubtreeSearchesPerQuery(const ReconstructionNearestIndex& index,
+                                      const PointCloud& scan,
+                                      size_t* sample_count_out) {
+  const size_t scan_size = scan.size();
+  if (scan_size == 0) {
+    *sample_count_out = 0;
+    return 1.0;
+  }
+  const size_t stride = std::max<size_t>(1, scan_size / kProbeSampleTarget);
+  const long long int sample_count =
+      static_cast<long long int>((scan_size + stride - 1) / stride);
+
+  long long int searches = 0;
+#pragma omp parallel
+  {
+    pcl::Indices knn_indices(1);
+    std::vector<float> knn_squared_dists(1);
+#pragma omp for schedule(static) reduction(+ : searches)
+    for (long long int sample = 0; sample < sample_count; ++sample) {
+      int visited = 0;
+      index.NearestSquaredDistanceCounted(
+          scan.at(static_cast<size_t>(sample) * stride), &knn_indices,
+          &knn_squared_dists, &visited);
+      searches += visited;
+    }
+  }
+
+  *sample_count_out = static_cast<size_t>(sample_count);
+  return static_cast<double>(searches) /
+         static_cast<double>(sample_count);
 }
 
 }  // namespace
@@ -536,6 +649,30 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   }
   ReconstructionNearestIndex reconstruction_nn_index;
   reconstruction_nn_index.Build(reconstruction, requested_partitions);
+
+  // How well the partition boxes actually prune is a property of the scene, not
+  // of the code, and the whole reason the partitioned build is worth doing is
+  // that it stays near one sub-tree search per query. Measure it on a sample of
+  // the queries that are about to be run, report it -- a campaign that regresses
+  // here should say so in its own log rather than be inferred from a wall clock
+  // -- and go back to the single index when it has collapsed.
+  if (reconstruction_nn_index.partition_count() > 1) {
+    size_t probe_sample_count = 0;
+    const double searches_per_query = MeasureSubtreeSearchesPerQuery(
+        reconstruction_nn_index, *scan, &probe_sample_count);
+    std::fprintf(stderr,
+                 "nn_index: partitioned into %d sub-trees, %.4f sub-tree "
+                 "searches per query over a %zu point probe\n",
+                 reconstruction_nn_index.partition_count(), searches_per_query,
+                 probe_sample_count);
+    if (searches_per_query > kMaxSubtreeSearchesPerQuery) {
+      std::fprintf(stderr,
+                   "nn_index: box pruning has collapsed on this scene (above "
+                   "%.2f); rebuilding as a single index\n",
+                   kMaxSubtreeSearchesPerQuery);
+      reconstruction_nn_index.BuildSingleIndex(reconstruction);
+    }
+  }
 
   // Differently shifted voxel grids.
   // Indexed by: [map_index], then by the dense cell id that the grid assigns to
