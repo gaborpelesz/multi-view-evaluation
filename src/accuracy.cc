@@ -81,6 +81,10 @@ struct AccuracyCellGrid {
     return map_.Lookup(key, &inserted);
   }
 
+  // Asks the hardware to fetch the table slot this key would probe first. A
+  // pure performance hint with no effect on what GetCell later returns.
+  inline void Prefetch(const VoxelCellKey& key) const { map_.Prefetch(key); }
+
   // Sizes the cell table for an expected number of cells, before the serial
   // pass starts inserting. Only the table geometry changes; the ids handed out
   // do not depend on it.
@@ -588,7 +592,11 @@ void ComputeAccuracy(
   // This pass is also what makes the parallel pass safe without a lock: after
   // it, every cell that will ever be touched exists and has a fixed id, so the
   // flat tally arrays can be sized once and never reallocate again.
-  // Indexed by: [point_index * kGridCount + grid_index].
+  // Indexed by: [grid_index * reconstruction_size + point_index]. Grid-major,
+  // so that each grid's ids are one sequential write stream; the point-major
+  // layout this used to have interleaved the two grids and made both streams
+  // strided. The array is not read until pass 1 has finished, so only the
+  // address an already-determined id is stored at changes.
   std::vector<uint32_t> point_cell_ids(
       static_cast<size_t>(reconstruction_size) * kGridCount);
   // Size both cell tables before anything is inserted. Left to grow from its
@@ -601,36 +609,67 @@ void ComputeAccuracy(
         voxel_size_inv, kGridShifts[grid_index][0], kGridShifts[grid_index][1],
         kGridShifts[grid_index][2]));
   }
+  // Both grids are walked together, one point at a time. kGridCount is a
+  // compile-time 2, so the grid loop unrolls and the point array is streamed
+  // once instead of once per grid. Every grid keeps its own table, its own id
+  // stream and its own memo below, and never reads another grid's state, so
+  // interleaving the two cannot change either grid's sequence of first-touched
+  // cells -- each still sees the points in strictly ascending index order.
+  uint32_t* grid_cell_ids[kGridCount];
+  // If a point falls into the same voxel as the previous one, remembering that
+  // cell saves a table lookup. How often that happens is entirely a property of
+  // the input's point order (measured on the bench dataset: ~0% here, because
+  // the reconstruction cloud is shuffled, but ~7% on the scan cloud in
+  // ComputeCompleteness, which is still in scanline order), so the memo is kept
+  // for the ordered case and is cheap when it never fires. The cell a point
+  // lands in is unaffected either way: the memo only short-circuits a lookup
+  // that would have returned the very same id.
+  VoxelCellKey previous_key[kGridCount];
+  uint32_t previous_id[kGridCount];
+  bool have_previous[kGridCount];
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
-    AccuracyCellGrid& grid = cell_maps[grid_index];
-    const float shift_x = kGridShifts[grid_index][0];
-    const float shift_y = kGridShifts[grid_index][1];
-    const float shift_z = kGridShifts[grid_index][2];
+    grid_cell_ids[grid_index] =
+        point_cell_ids.data() +
+        static_cast<size_t>(grid_index) * reconstruction_size;
+    previous_key[grid_index] = VoxelCellKey{0, 0, 0};
+    previous_id[grid_index] = 0;
+    have_previous[grid_index] = false;
+  }
 
-    // Consecutive reconstruction points usually fall into the same voxel;
-    // remembering the previous key saves most of the table lookups. The cell a
-    // point lands in is unaffected: the memo only short-circuits a lookup that
-    // would have returned the very same id.
-    VoxelCellKey previous_key = {0, 0, 0};
-    uint32_t previous_id = 0;
-    bool have_previous = false;
+  // The lookups themselves are random accesses into a 134 MB table and miss
+  // cache almost every time, while the points are read sequentially, so the key
+  // of a point some distance ahead can be computed for free and its table slot
+  // fetched while the current point is being resolved. 12 points ahead measured
+  // best in the 8-16 range.
+  const long long int kPrefetchDistance = 12;
 
-    for (long long int point_index = 0; point_index < reconstruction_size;
-         ++point_index) {
-      const VoxelCellKey key =
-          CalcCellCoordinates(reconstruction.at(point_index), voxel_size_inv,
-                              shift_x, shift_y, shift_z);
-      uint32_t cell_id;
-      if (have_previous && key == previous_key) {
-        cell_id = previous_id;
-      } else {
-        cell_id = grid.GetCell(key);
-        previous_key = key;
-        previous_id = cell_id;
-        have_previous = true;
+  for (long long int point_index = 0; point_index < reconstruction_size;
+       ++point_index) {
+    if (point_index + kPrefetchDistance < reconstruction_size) {
+      const pcl::PointXYZ& ahead_point =
+          reconstruction.at(point_index + kPrefetchDistance);
+      for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+        cell_maps[grid_index].Prefetch(CalcCellCoordinates(
+            ahead_point, voxel_size_inv, kGridShifts[grid_index][0],
+            kGridShifts[grid_index][1], kGridShifts[grid_index][2]));
       }
-      point_cell_ids[static_cast<size_t>(point_index) * kGridCount +
-                     grid_index] = cell_id;
+    }
+
+    const pcl::PointXYZ& point = reconstruction.at(point_index);
+    for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+      const VoxelCellKey key = CalcCellCoordinates(
+          point, voxel_size_inv, kGridShifts[grid_index][0],
+          kGridShifts[grid_index][1], kGridShifts[grid_index][2]);
+      uint32_t cell_id;
+      if (have_previous[grid_index] && key == previous_key[grid_index]) {
+        cell_id = previous_id[grid_index];
+      } else {
+        cell_id = cell_maps[grid_index].GetCell(key);
+        previous_key[grid_index] = key;
+        previous_id[grid_index] = cell_id;
+        have_previous[grid_index] = true;
+      }
+      grid_cell_ids[grid_index][point_index] = cell_id;
     }
   }
 
@@ -647,7 +686,12 @@ void ComputeAccuracy(
     accurate_histogram_ptrs[grid_index] = grid.accurate_histogram.data();
     inaccurate_histogram_ptrs[grid_index] = grid.inaccurate_histogram.data();
   }
-  const uint32_t* point_cell_ids_ptr = point_cell_ids.data();
+  const uint32_t* point_cell_ids_ptrs[kGridCount];
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    point_cell_ids_ptrs[grid_index] =
+        point_cell_ids.data() +
+        static_cast<size_t>(grid_index) * reconstruction_size;
+  }
 
   // Pass 2 (parallel): loop over the reconstruction points. Every iteration
   // only reads the scan grids and writes integer tallies of its own cells plus
@@ -714,9 +758,7 @@ void ComputeAccuracy(
     // accumulated into counts below.
     for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
       const size_t bin_offset =
-          static_cast<size_t>(
-              point_cell_ids_ptr[static_cast<size_t>(point_index) * kGridCount +
-                                 grid_index]) *
+          static_cast<size_t>(point_cell_ids_ptrs[grid_index][point_index]) *
               histogram_stride +
           aggregate_first_accurate_tolerance_index;
       uint32_t* accurate_bin = accurate_histogram_ptrs[grid_index] + bin_offset;

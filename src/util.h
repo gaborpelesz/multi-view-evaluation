@@ -210,6 +210,20 @@ class VoxelCellIndexMap {
     }
   }
 
+  // Asks the hardware to fetch the first slot a lookup of this key would probe
+  // into cache, for writing. That slot's address is Hash(key) & mask_, a pure
+  // function of the key and the current table geometry, so the address is
+  // correct no matter which keys are inserted between the hint and the lookup;
+  // and a prefetch has no architectural effect whatsoever, so even a wrong
+  // address could only cost time, never change a result.
+  inline void Prefetch(const VoxelCellKey& key) const {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(&slots_[static_cast<size_t>(Hash(key)) & mask_], 1, 3);
+#else
+    (void)key;
+#endif
+  }
+
   // Number of distinct cells seen so far; also the size of the callers' flat
   // per-cell arrays.
   inline uint32_t size() const { return size_; }
