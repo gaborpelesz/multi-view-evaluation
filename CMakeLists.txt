@@ -131,6 +131,8 @@ add_executable(ETH3DMultiViewEvaluation
     src/main.cc
     src/meshlab_project.cc
     src/meshlab_project.h
+    src/nn_grid.cc
+    src/nn_grid.h
     src/tinyxml2.cpp
     src/tinyxml2.h
     src/util.h
