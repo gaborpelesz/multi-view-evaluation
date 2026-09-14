@@ -224,13 +224,24 @@ bool ParseSupportedHeader(const std::vector<char>& buffer,
 
 }  // namespace
 
-bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud) {
+bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud,
+                      LoadFailure* failure) {
+  // A local sink keeps the rest of the function from having to null-check.
+  LoadFailure ignored = LoadFailure::kNone;
+  if (failure == nullptr) {
+    failure = &ignored;
+  }
+  // Every `return false` below is a shape or integrity rejection except the
+  // fopen() one, which overwrites this.
+  *failure = LoadFailure::kNotFastPathShape;
+
   if (!HostIsLittleEndian()) {
     return false;
   }
 
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
+    *failure = LoadFailure::kCannotOpen;
     return false;
   }
 
@@ -252,8 +263,13 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud) {
   // turning into a huge allocation.
   boost::system::error_code error;
   const boost::uintmax_t file_size = boost::filesystem::file_size(path, error);
-  if (error || static_cast<std::uint64_t>(file_size) !=
-                   data_offset + vertex_count * kDiskPointSize) {
+  if (error) {
+    std::fclose(file);
+    *failure = LoadFailure::kCannotOpen;
+    return false;
+  }
+  if (static_cast<std::uint64_t>(file_size) !=
+      data_offset + vertex_count * kDiskPointSize) {
     std::fclose(file);
     return false;
   }
@@ -314,6 +330,7 @@ bool LoadBinaryXyzPly(const std::string& path, PointCloud* cloud) {
   cloud->is_dense = (any_non_finite == 0);
 
   std::fclose(file);
+  *failure = LoadFailure::kNone;
   return true;
 }
 

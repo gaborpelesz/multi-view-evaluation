@@ -109,8 +109,37 @@ link_directories(${Boost_LIBRARY_DIRS})
 # External dependency: Eigen3
 find_package(Eigen3 REQUIRED CONFIG)
 
-# External dependency: PCL
-find_package(PCL 1.7 REQUIRED COMPONENTS common io search kdtree)
+# ---------------------------------------------------------------------------
+# External dependency: PCL, and the general PLY reader fallback.
+#
+# libpcl_io declares 21 direct VTK dependencies, so asking for PCL's `io`
+# component drags 47 VTK dylibs -- libvtkGUISupportQt, libvtkRenderingOpenGL2
+# and libvtkRenderingLOD among them -- into a command-line scorer that never
+# renders anything. On arm64/macOS, dyld plus the static initialisers of those
+# libraries cost ~68 ms of every single invocation, measured from exec() to the
+# first instruction of main().
+#
+# The evaluator reaches libpcl_io for exactly one thing: pcl::io::loadPLYFile,
+# as the fallback behind fast_ply's reader. (The classification-cloud writers
+# used to reach it too; they now use fast_ply's own writer, which reproduces
+# pcl::io::savePLYFileBinary byte for byte.) Measurement builds therefore leave
+# `io` out, and a PLY file whose variant the fast path does not handle becomes a
+# typed hard failure -- exit code 3, with a message naming this option --
+# instead of a slow success.
+#
+# Turn this ON to restore upstream's behaviour for arbitrary PLY inputs. It is
+# also the differential test for the fast path: the same dataset read through
+# both readers must produce the same results.
+# ---------------------------------------------------------------------------
+option(MVE_PCL_IO_FALLBACK
+       "Link PCL's general PLY reader (libpcl_io and the 47 VTK dylibs behind it) as the fallback for PLY files fast_ply does not handle."
+       OFF)
+
+set(MVE_PCL_COMPONENTS common search kdtree)
+if(MVE_PCL_IO_FALLBACK)
+  list(APPEND MVE_PCL_COMPONENTS io)
+endif()
+find_package(PCL 1.7 REQUIRED COMPONENTS ${MVE_PCL_COMPONENTS})
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -142,6 +171,9 @@ target_link_libraries(ETH3DMultiViewEvaluation
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
 )
+if(MVE_PCL_IO_FALLBACK)
+  target_compile_definitions(ETH3DMultiViewEvaluation PRIVATE MVE_PCL_IO_FALLBACK)
+endif()
 
 # ThinLTO. Checked here, after the compiler settings above are final.
 if(MVE_LTO)
