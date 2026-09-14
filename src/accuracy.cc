@@ -81,6 +81,11 @@ struct AccuracyCellGrid {
     return map_.Lookup(key, &inserted);
   }
 
+  // Sizes the cell table for an expected number of cells, before the serial
+  // pass starts inserting. Only the table geometry changes; the ids handed out
+  // do not depend on it.
+  inline void Reserve(size_t expected_cells) { map_.Reserve(expected_cells); }
+
   inline size_t cell_count() const { return map_.size(); }
 
   // Histogram of the first tolerance index for which a reconstruction point of
@@ -586,6 +591,16 @@ void ComputeAccuracy(
   // Indexed by: [point_index * kGridCount + grid_index].
   std::vector<uint32_t> point_cell_ids(
       static_cast<size_t>(reconstruction_size) * kGridCount);
+  // Size both cell tables before anything is inserted. Left to grow from its
+  // 1024-slot default, each table doubles its way up to millions of slots and
+  // re-probes every cell it holds at every doubling, which costs more random
+  // probes than answering the lookups does.
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    cell_maps[grid_index].Reserve(EstimateDistinctCellCount(
+        reconstruction.points.data(), static_cast<size_t>(reconstruction_size),
+        voxel_size_inv, kGridShifts[grid_index][0], kGridShifts[grid_index][1],
+        kGridShifts[grid_index][2]));
+  }
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
     AccuracyCellGrid& grid = cell_maps[grid_index];
     const float shift_x = kGridShifts[grid_index][0];

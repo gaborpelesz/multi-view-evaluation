@@ -72,6 +72,14 @@ struct CompletenessCellGrid {
     return cell_id;
   }
 
+  // Sizes the cell table and the per-cell point count array for an expected
+  // number of cells, before the serial pass starts inserting. Only the table
+  // geometry changes; the ids handed out do not depend on it.
+  inline void Reserve(size_t expected_cells) {
+    map_.Reserve(expected_cells);
+    point_count.reserve(expected_cells);
+  }
+
   inline size_t cell_count() const { return map_.size(); }
 
   // Number of scan points within a cell.
@@ -325,6 +333,16 @@ void ComputeCompleteness(const MeshLabMeshInfoVector& scan_infos,
   // Indexed by: [scan_point_index * kGridCount + grid_index].
   std::vector<uint32_t> point_cell_ids(
       static_cast<size_t>(scan_point_size) * kGridCount);
+  // Size both cell tables and their point count arrays before anything is
+  // inserted. Left to grow from its 1024-slot default, each table doubles its
+  // way up to millions of slots and re-probes every cell it holds at every
+  // doubling, which costs more random probes than answering the lookups does.
+  for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
+    cell_maps[grid_index].Reserve(EstimateDistinctCellCount(
+        scan->points.data(), static_cast<size_t>(scan_point_size),
+        voxel_size_inv, kGridShifts[grid_index][0], kGridShifts[grid_index][1],
+        kGridShifts[grid_index][2]));
+  }
   for (int grid_index = 0; grid_index < kGridCount; ++grid_index) {
     CompletenessCellGrid& grid = cell_maps[grid_index];
     const float shift_x = kGridShifts[grid_index][0];
