@@ -30,9 +30,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
+#include <sstream>
 
 #include <Eigen/StdVector>
-#include <pcl/io/ply_io.h>
+
+#include "fast_ply.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1016,6 +1019,10 @@ void WriteAccuracyVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    pcl::io::savePLYFileBinary(file_path.str(), accuracy_visualization);
+    if (!fast_ply::WriteBinaryXyzRgbPly(file_path.str(),
+                                        accuracy_visualization)) {
+      std::cerr << "Cannot write accuracy visualization to " << file_path.str()
+                << std::endl;
+    }
   }
 }

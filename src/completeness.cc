@@ -29,15 +29,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 #include "completeness.h"
 
 #include <pcl/common/transforms.h>
-#include <pcl/io/ply_io.h>
 #include <pcl/search/kdtree.h>
 
+#include "fast_ply.h"
 #include "nn_grid.h"
 
 const int kGridCount = 2;
@@ -644,6 +646,10 @@ void WriteCompletenessVisualization(
     std::ostringstream file_path;
     file_path << base_path << ".tolerance_"
               << sorted_tolerances[tolerance_index] << ".ply";
-    pcl::io::savePLYFileBinary(file_path.str(), completeness_visualization);
+    if (!fast_ply::WriteBinaryXyzRgbPly(file_path.str(),
+                                        completeness_visualization)) {
+      std::cerr << "Cannot write completeness visualization to "
+                << file_path.str() << std::endl;
+    }
   }
 }
