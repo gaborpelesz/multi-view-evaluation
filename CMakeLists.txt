@@ -139,6 +139,17 @@ set(MVE_PCL_COMPONENTS common search kdtree)
 if(MVE_PCL_IO_FALLBACK)
   list(APPEND MVE_PCL_COMPONENTS io)
 endif()
+# Ubuntu's VTK 9.1 package declares VTK::mpi with MPI::MPI_C in its link
+# interface but ships no vtk-find-package-helpers.cmake to define that target,
+# so asking PCLConfig for `io` -- which resolves VTK -- dies on a target it
+# never creates. Defining it here first is enough. The C language has to be
+# enabled explicitly because this project declares CXX only, and FindMPI
+# searches per enabled language: without this, find_package(MPI) silently
+# yields no MPI::MPI_C and the VTK failure is unchanged.
+if(MVE_PCL_IO_FALLBACK)
+  enable_language(C)
+  find_package(MPI QUIET)
+endif()
 find_package(PCL 1.7 REQUIRED COMPONENTS ${MVE_PCL_COMPONENTS})
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
